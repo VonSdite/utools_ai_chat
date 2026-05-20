@@ -9,6 +9,7 @@
     summary: { title: "总结", action: "总结" },
     explain: { title: "解释", action: "解释" }
   };
+  var MODEL_MODES = ["translate", "summary", "explain", "chat"];
   var TEXT_EXTENSIONS = [
     "txt", "md", "markdown", "csv", "tsv", "json", "jsonl", "yaml", "yml",
     "xml", "html", "htm", "log", "ini", "conf", "js", "jsx", "ts", "tsx",
@@ -19,13 +20,14 @@
   var MAX_IMAGE_ATTACHMENTS = 3;
   var api = window.markMind || window.quickEnglish || createBrowserFallbackApi();
   var state = {
-    config: { providers: [], defaultProviderId: "", defaultModelId: "" },
+    config: { providers: [], modeModels: createEmptyModeModels() },
     draftProviders: [],
     activeTab: "translate",
     activeTaskMode: "translate",
     taskAttachments: [],
     chatAttachments: [],
     chatStore: { assistants: [], activeAssistantId: "" },
+    assistantsOpen: false,
     currentResult: "",
     running: false,
     fetchingModelsProviderId: "",
@@ -45,6 +47,7 @@
     await loadChatStore();
     renderSettings();
     renderChat();
+    renderTaskModelSelect();
     updateViewTitle();
     updateModelBadge();
 
@@ -69,6 +72,7 @@
     els.taskAttachments = document.getElementById("taskAttachments");
     els.taskFileInput = document.getElementById("taskFileInput");
     els.taskAttachBtn = document.getElementById("taskAttachBtn");
+    els.taskModelSelect = document.getElementById("taskModelSelect");
     els.sendTaskBtn = document.getElementById("sendTaskBtn");
     els.stopTaskBtn = document.getElementById("stopTaskBtn");
     els.clearTaskBtn = document.getElementById("clearTaskBtn");
@@ -80,6 +84,9 @@
     els.newSessionBtn = document.getElementById("newSessionBtn");
     els.sessionsList = document.getElementById("sessionsList");
     els.newAssistantBtn = document.getElementById("newAssistantBtn");
+    els.assistantSection = document.getElementById("assistantSection");
+    els.assistantToggleBtn = document.getElementById("assistantToggleBtn");
+    els.currentAssistantName = document.getElementById("currentAssistantName");
     els.assistantsList = document.getElementById("assistantsList");
     els.assistantNameInput = document.getElementById("assistantNameInput");
     els.assistantProviderSelect = document.getElementById("assistantProviderSelect");
@@ -93,7 +100,6 @@
     els.stopChatBtn = document.getElementById("stopChatBtn");
     els.addProviderBtn = document.getElementById("addProviderBtn");
     els.saveSettingsBtn = document.getElementById("saveSettingsBtn");
-    els.defaultProviderSelect = document.getElementById("defaultProviderSelect");
     els.providersList = document.getElementById("providersList");
     els.toast = document.getElementById("toast");
   }
@@ -111,6 +117,9 @@
       event.target.value = "";
     });
     els.taskAttachments.addEventListener("click", handleAttachmentClick);
+    els.taskModelSelect.addEventListener("change", function (event) {
+      updateModeModel(state.activeTaskMode, event.target.value);
+    });
     els.inputText.addEventListener("keydown", function (event) {
       handleSubmitKeydown(event, startTask);
     });
@@ -118,9 +127,12 @@
     els.newSessionBtn.addEventListener("click", createNewSession);
     els.sessionsList.addEventListener("click", handleSessionClick);
     els.newAssistantBtn.addEventListener("click", createNewAssistant);
+    els.assistantToggleBtn.addEventListener("click", toggleAssistantPanel);
     els.assistantsList.addEventListener("click", handleAssistantClick);
     els.assistantNameInput.addEventListener("input", updateActiveAssistantFromForm);
-    els.assistantProviderSelect.addEventListener("change", updateActiveAssistantFromForm);
+    els.assistantProviderSelect.addEventListener("change", function (event) {
+      updateModeModel("chat", event.target.value);
+    });
     els.assistantPromptInput.addEventListener("input", updateActiveAssistantFromForm);
     els.sendChatBtn.addEventListener("click", sendChatMessage);
     els.stopChatBtn.addEventListener("click", stopActiveRequest);
@@ -139,12 +151,6 @@
 
     els.addProviderBtn.addEventListener("click", addProvider);
     els.saveSettingsBtn.addEventListener("click", saveSettings);
-    els.defaultProviderSelect.addEventListener("change", function (event) {
-      var selection = parseModelValue(event.target.value);
-      state.config.defaultProviderId = selection.providerId;
-      state.config.defaultModelId = selection.modelId;
-      updateModelBadge();
-    });
     els.providersList.addEventListener("input", handleProviderInput);
     els.providersList.addEventListener("change", handleProviderInput);
     els.providersList.addEventListener("click", handleProviderClick);
@@ -255,6 +261,9 @@
     els.chatView.classList.toggle("is-active", tabName === "chat");
     els.settingsView.classList.toggle("is-active", tabName === "settings");
     updateViewTitle();
+    renderTaskModelSelect();
+    renderChatModelSelect();
+    updateModelBadge();
   }
 
   function updateViewTitle() {
@@ -287,7 +296,7 @@
     }
 
     if (!provider) {
-      showToast("先选一个默认模型");
+      showToast("先配置一个模型");
       setTab("settings");
       return;
     }
@@ -671,8 +680,10 @@
 
   function renderChat() {
     ensureActiveAssistantAndSession();
+    renderAssistantPanelState();
     renderAssistants();
     renderAssistantEditor();
+    renderChatModelSelect();
     renderSessions();
     renderMessages();
     updateModelBadge();
@@ -705,6 +716,11 @@
   }
 
   function renderAssistants() {
+    var activeAssistant = getActiveAssistant();
+    if (els.currentAssistantName) {
+      els.currentAssistantName.textContent = activeAssistant ? activeAssistant.name || "默认助手" : "默认助手";
+    }
+
     els.assistantsList.innerHTML = state.chatStore.assistants
       .map(function (assistant) {
         var activeClass = assistant.id === state.chatStore.activeAssistantId ? " is-active" : "";
@@ -715,7 +731,7 @@
           escapeAttr(assistant.id) +
           '">' +
           '<button class="assistant-title" type="button" data-action="select-assistant">' +
-          escapeHtml(assistant.name || "新助手") +
+          escapeHtml(assistant.name || "默认助手") +
           "</button>" +
           '<button class="assistant-delete" type="button" title="删除助手" aria-label="删除助手" data-action="delete-assistant">×</button>' +
           "</div>"
@@ -724,12 +740,25 @@
       .join("");
   }
 
+  function renderAssistantPanelState() {
+    if (els.assistantSection) {
+      els.assistantSection.classList.toggle("is-open", state.assistantsOpen);
+    }
+    if (els.assistantToggleBtn) {
+      els.assistantToggleBtn.setAttribute("aria-expanded", state.assistantsOpen ? "true" : "false");
+    }
+  }
+
+  function toggleAssistantPanel() {
+    state.assistantsOpen = !state.assistantsOpen;
+    renderAssistantPanelState();
+  }
+
   function renderAssistantEditor() {
     var assistant = getActiveAssistant();
     if (!assistant) {
       els.assistantNameInput.value = "";
       els.assistantPromptInput.value = "";
-      renderAssistantProviderSelect("");
       return;
     }
 
@@ -739,31 +768,82 @@
     if (document.activeElement !== els.assistantPromptInput) {
       els.assistantPromptInput.value = assistant.prompt || "";
     }
-    renderAssistantProviderSelect(formatModelValue(assistant.providerId, assistant.modelId));
   }
 
-  function renderAssistantProviderSelect(selectedValue) {
-    var providers = state.draftProviders.length ? state.draftProviders : state.config.providers;
-    els.assistantProviderSelect.innerHTML = "";
+  function renderTaskModelSelect() {
+    renderModeModelSelect(els.taskModelSelect, state.activeTaskMode);
+  }
 
-    var globalOption = document.createElement("option");
-    globalOption.value = "";
-    globalOption.textContent = "跟随默认模型";
-    els.assistantProviderSelect.appendChild(globalOption);
+  function renderChatModelSelect() {
+    renderModeModelSelect(els.assistantProviderSelect, "chat", getActiveSession());
+  }
 
+  function renderModeModelSelect(selectEl, mode, session) {
+    if (!selectEl) {
+      return;
+    }
+
+    var providers = state.config.providers || [];
+    selectEl.innerHTML = "";
+
+    if (!countModels(providers)) {
+      var emptyOption = document.createElement("option");
+      emptyOption.value = "";
+      emptyOption.textContent = "未配置模型";
+      selectEl.appendChild(emptyOption);
+      selectEl.disabled = true;
+      return;
+    }
+
+    selectEl.disabled = false;
     providers.forEach(function (provider) {
       provider.models.forEach(function (model) {
         var option = document.createElement("option");
         option.value = formatModelValue(provider.id, model.id);
         option.textContent =
           (provider.name || "未命名 provider") + " / " + (model.model || "未设置模型");
-        els.assistantProviderSelect.appendChild(option);
+        selectEl.appendChild(option);
       });
     });
 
-    els.assistantProviderSelect.value = modelSelectionExists(providers, selectedValue)
-      ? selectedValue
-      : "";
+    var selected = session && session.providerId && session.modelId
+      ? { providerId: session.providerId, modelId: session.modelId }
+      : null;
+    if (!selected || !getProviderModel(selected.providerId, selected.modelId, providers)) {
+      ensureModeModel(mode, providers);
+      selected = state.config.modeModels[mode] || {};
+      if (session && mode === "chat") {
+        session.providerId = selected.providerId || "";
+        session.modelId = selected.modelId || "";
+        saveChatStoreQuietly();
+      }
+    }
+    selectEl.value = formatModelValue(selected.providerId, selected.modelId);
+  }
+
+  function updateModeModel(mode, value) {
+    var providers = state.config.providers || [];
+    var selection = parseModelValue(value);
+    if (!getProviderModel(selection.providerId, selection.modelId, providers)) {
+      ensureModeModel(mode, providers);
+    } else {
+      state.config.modeModels[mode] = {
+        providerId: selection.providerId,
+        modelId: selection.modelId
+      };
+      if (mode === "chat") {
+        var session = getActiveSession();
+        if (session) {
+          session.providerId = selection.providerId;
+          session.modelId = selection.modelId;
+          saveChatStoreQuietly();
+        }
+      }
+    }
+    renderTaskModelSelect();
+    renderChatModelSelect();
+    updateModelBadge();
+    saveConfigQuietly();
   }
 
   function renderSessions() {
@@ -854,6 +934,7 @@
     }
 
     state.chatStore.activeAssistantId = item.dataset.assistantId;
+    state.assistantsOpen = false;
     ensureActiveAssistantAndSession();
     saveChatStoreQuietly();
     renderChat();
@@ -863,6 +944,7 @@
     var assistant = createAssistant();
     state.chatStore.assistants.unshift(assistant);
     state.chatStore.activeAssistantId = assistant.id;
+    state.assistantsOpen = true;
     state.chatAttachments = [];
     els.chatInput.value = "";
     saveChatStoreQuietly();
@@ -886,10 +968,7 @@
       return;
     }
 
-    assistant.name = els.assistantNameInput.value.trim() || "新助手";
-    var selection = parseModelValue(els.assistantProviderSelect.value);
-    assistant.providerId = selection.providerId;
-    assistant.modelId = selection.modelId;
+    assistant.name = els.assistantNameInput.value.trim() || "默认助手";
     assistant.prompt = els.assistantPromptInput.value;
     assistant.updatedAt = Date.now();
     saveChatStoreQuietly();
@@ -960,7 +1039,7 @@
     }
 
     if (!provider) {
-      showToast("先选一个默认模型");
+      showToast("先配置一个模型");
       setTab("settings");
       return;
     }
@@ -1067,9 +1146,14 @@
 
   function createSession() {
     var now = Date.now();
+    var selection = state.config && state.config.modeModels
+      ? state.config.modeModels.chat || { providerId: "", modelId: "" }
+      : { providerId: "", modelId: "" };
     return {
       id: createId("session"),
       title: "新会话",
+      providerId: selection.providerId || "",
+      modelId: selection.modelId || "",
       createdAt: now,
       updatedAt: now,
       messages: []
@@ -1081,7 +1165,7 @@
     var session = createSession();
     return {
       id: createId("assistant"),
-      name: "新助手",
+      name: "默认助手",
       prompt: "",
       providerId: "",
       modelId: "",
@@ -1131,13 +1215,14 @@
 
   function getChatProvider(assistant) {
     var providers = state.config.providers || [];
-    if (assistant && assistant.providerId) {
-      var assistantProvider = getProviderModel(assistant.providerId, assistant.modelId, providers);
-      if (assistantProvider) {
-        return assistantProvider;
+    var session = getActiveSession();
+    if (session && session.providerId && session.modelId) {
+      var sessionProvider = getProviderModel(session.providerId, session.modelId, providers);
+      if (sessionProvider) {
+        return sessionProvider;
       }
     }
-    return getActiveProvider();
+    return getModeProvider("chat", providers);
   }
 
   async function saveChatStoreQuietly() {
@@ -1150,45 +1235,19 @@
     }
   }
 
-  function renderSettings() {
-    renderDefaultSelect();
-    renderProviders();
-    renderAssistantEditor();
+  async function saveConfigQuietly() {
+    try {
+      if (api.saveConfig) {
+        state.config = normalizeConfig(await api.saveConfig(state.config));
+      }
+    } catch (error) {
+      // Choosing a model should remain responsive even if storage is temporarily unavailable.
+    }
   }
 
-  function renderDefaultSelect() {
-    var providers = state.draftProviders;
-    els.defaultProviderSelect.innerHTML = "";
-
-    if (!countModels(providers)) {
-      var emptyOption = document.createElement("option");
-      emptyOption.value = "";
-      emptyOption.textContent = "未配置";
-      els.defaultProviderSelect.appendChild(emptyOption);
-      els.defaultProviderSelect.disabled = true;
-      return;
-    }
-
-    els.defaultProviderSelect.disabled = false;
-    providers.forEach(function (provider) {
-      provider.models.forEach(function (model) {
-        var option = document.createElement("option");
-        option.value = formatModelValue(provider.id, model.id);
-        option.textContent =
-          (provider.name || "未命名 provider") + " / " + (model.model || "未设置模型");
-        els.defaultProviderSelect.appendChild(option);
-      });
-    });
-
-    var selectedValue = formatModelValue(state.config.defaultProviderId, state.config.defaultModelId);
-    if (!modelSelectionExists(providers, selectedValue)) {
-      var first = getFirstProviderModel(providers);
-      state.config.defaultProviderId = first ? first.provider.id : "";
-      state.config.defaultModelId = first ? first.model.id : "";
-      selectedValue = first ? formatModelValue(first.provider.id, first.model.id) : "";
-    }
-
-    els.defaultProviderSelect.value = selectedValue;
+  function renderSettings() {
+    renderProviders();
+    renderAssistantEditor();
   }
 
   function renderProviders() {
@@ -1367,7 +1426,6 @@
     if (modelCount) {
       modelCount.textContent = (provider.models || []).length + " 个";
     }
-    renderDefaultSelect();
     renderAssistantEditor();
     updateModelBadge();
   }
@@ -1504,10 +1562,6 @@
     var provider = createProvider();
     state.draftProviders.push(provider);
     state.expandedProviderIds[provider.id] = true;
-    if (!state.config.defaultProviderId) {
-      state.config.defaultProviderId = provider.id;
-      state.config.defaultModelId = provider.models[0].id;
-    }
     renderSettings();
     updateModelBadge();
   }
@@ -1581,13 +1635,8 @@
     });
     delete state.expandedProviderIds[providerId];
 
-    if (state.config.defaultProviderId === providerId) {
-      var first = getFirstProviderModel(state.draftProviders);
-      state.config.defaultProviderId = first ? first.provider.id : "";
-      state.config.defaultModelId = first ? first.model.id : "";
-    }
-
-    clearAssistantModelRefs(providerId, "");
+    ensureModeModels(state.config, state.draftProviders);
+    clearSessionModelRefs(providerId, "");
     renderSettings();
     updateModelBadge();
   }
@@ -1605,33 +1654,30 @@
       return model.id !== modelId;
     });
 
-    if (state.config.defaultProviderId === providerId && state.config.defaultModelId === modelId) {
-      state.config.defaultModelId = provider.models[0].id;
-    }
-
-    clearAssistantModelRefs(providerId, modelId);
+    ensureModeModels(state.config, state.draftProviders);
+    clearSessionModelRefs(providerId, modelId);
     renderSettings();
     updateModelBadge();
   }
 
-  function clearAssistantModelRefs(providerId, modelId) {
+  function clearSessionModelRefs(providerId, modelId) {
     state.chatStore.assistants.forEach(function (assistant) {
-      var sameProvider = assistant.providerId === providerId;
-      var sameModel = !modelId || assistant.modelId === modelId;
-      if (sameProvider && sameModel) {
-        assistant.providerId = "";
-        assistant.modelId = "";
-      }
+      (assistant.sessions || []).forEach(function (session) {
+        var sameProvider = session.providerId === providerId;
+        var sameModel = !modelId || session.modelId === modelId;
+        if (sameProvider && sameModel) {
+          session.providerId = "";
+          session.modelId = "";
+        }
+      });
     });
     saveChatStoreQuietly();
   }
 
   async function saveSettings() {
-    var selection = parseModelValue(els.defaultProviderSelect.value);
     var nextConfig = {
       providers: state.draftProviders.map(trimProvider),
-      defaultProviderId: selection.providerId,
-      defaultModelId: selection.modelId
+      modeModels: cloneModeModels(state.config.modeModels)
     };
     var validationMessage = validateConfig(nextConfig);
     if (validationMessage) {
@@ -1643,6 +1689,8 @@
       state.config = normalizeConfig(await api.saveConfig(nextConfig));
       state.draftProviders = cloneProviders(state.config.providers);
       renderSettings();
+      renderTaskModelSelect();
+      renderChatModelSelect();
       updateModelBadge();
       showToast("已保存");
     } catch (error) {
@@ -1653,17 +1701,6 @@
   function validateConfig(config) {
     if (!config.providers.length) {
       return "";
-    }
-
-    if (
-      !config.providers.some(function (provider) {
-        return provider.id === config.defaultProviderId &&
-          provider.models.some(function (model) {
-            return model.id === config.defaultModelId;
-          });
-      })
-    ) {
-      return "先选一个默认模型";
     }
 
     for (var index = 0; index < config.providers.length; index += 1) {
@@ -1740,22 +1777,20 @@
   }
 
   function getActiveProvider() {
-    return getProviderModel(
-      state.config.defaultProviderId,
-      state.config.defaultModelId,
-      state.config.providers || []
-    );
+    return getModeProvider(state.activeTaskMode, state.config.providers || []);
+  }
+
+  function getModeProvider(mode, providers) {
+    ensureModeModel(mode, providers);
+    var selection = state.config.modeModels[mode] || {};
+    return getProviderModel(selection.providerId, selection.modelId, providers) ||
+      getFirstResolvedProviderModel(providers);
   }
 
   function updateModelBadge() {
     var assistant = state.activeTab === "chat" ? getActiveAssistant() : null;
-    var provider =
-      (assistant && assistant.providerId
-        ? getProviderModel(assistant.providerId, assistant.modelId, state.draftProviders) ||
-          getProviderModel(assistant.providerId, assistant.modelId, state.config.providers || [])
-        : null) ||
-      getProviderModel(state.config.defaultProviderId, state.config.defaultModelId, state.draftProviders) ||
-      getActiveProvider();
+    var mode = state.activeTab === "chat" ? "chat" : state.activeTaskMode;
+    var provider = getModeProvider(mode, state.config.providers || []);
 
     if (!provider) {
       els.modelBadge.textContent = "未配置模型";
@@ -1769,7 +1804,7 @@
           ? "系统代理"
           : "自定义代理";
     els.modelBadge.textContent =
-      (assistant ? (assistant.name || "新助手") + " / " : "") +
+      (assistant ? (assistant.name || "默认助手") + " / " : "") +
       (provider.name || "未命名 provider") +
       " / " +
       (provider.model || "未设置模型") +
@@ -1804,29 +1839,15 @@
     var providers = Array.isArray(source.providers)
       ? source.providers.map(normalizeProvider)
       : [];
-    var defaultProviderId =
-      typeof source.defaultProviderId === "string" ? source.defaultProviderId : "";
-    var defaultModelId =
-      typeof source.defaultModelId === "string" ? source.defaultModelId : "";
-
-    if (
-      providers.length &&
-      !providers.some(function (provider) {
-        return provider.id === defaultProviderId &&
-          provider.models.some(function (model) {
-            return model.id === defaultModelId;
-          });
-      })
-    ) {
-      var first = getFirstProviderModel(providers);
-      defaultProviderId = first ? first.provider.id : "";
-      defaultModelId = first ? first.model.id : "";
-    }
+    var legacySelection = {
+      providerId: typeof source.defaultProviderId === "string" ? source.defaultProviderId : "",
+      modelId: typeof source.defaultModelId === "string" ? source.defaultModelId : ""
+    };
+    var modeModels = normalizeModeModels(source.modeModels, providers, legacySelection);
 
     return {
       providers: providers,
-      defaultProviderId: providers.length ? defaultProviderId : "",
-      defaultModelId: providers.length ? defaultModelId : ""
+      modeModels: modeModels
     };
   }
 
@@ -1944,7 +1965,7 @@
 
     return {
       id: typeof assistant.id === "string" && assistant.id ? assistant.id : createId("assistant"),
-      name: typeof assistant.name === "string" && assistant.name ? assistant.name : "新助手",
+      name: typeof assistant.name === "string" && assistant.name ? assistant.name : "默认助手",
       prompt: typeof assistant.prompt === "string" ? assistant.prompt : "",
       providerId: typeof assistant.providerId === "string" ? assistant.providerId : "",
       modelId: typeof assistant.modelId === "string" ? assistant.modelId : "",
@@ -1962,6 +1983,8 @@
     return {
       id: typeof session.id === "string" && session.id ? session.id : createId("session"),
       title: typeof session.title === "string" && session.title ? session.title : "新会话",
+      providerId: typeof session.providerId === "string" ? session.providerId : "",
+      modelId: typeof session.modelId === "string" ? session.modelId : "",
       createdAt: Number(session.createdAt) || Date.now(),
       updatedAt: Number(session.updatedAt) || Date.now(),
       messages: Array.isArray(session.messages)
@@ -2012,6 +2035,69 @@
     });
   }
 
+  function createEmptyModeModels() {
+    return MODEL_MODES.reduce(function (result, mode) {
+      result[mode] = { providerId: "", modelId: "" };
+      return result;
+    }, {});
+  }
+
+  function normalizeModeModels(source, providers, fallbackSelection) {
+    var result = createEmptyModeModels();
+    MODEL_MODES.forEach(function (mode) {
+      var item = source && typeof source === "object" ? source[mode] : null;
+      var selection = {
+        providerId: item && typeof item.providerId === "string" ? item.providerId : "",
+        modelId: item && typeof item.modelId === "string" ? item.modelId : ""
+      };
+      if (!getProviderModel(selection.providerId, selection.modelId, providers)) {
+        selection = fallbackSelection || { providerId: "", modelId: "" };
+      }
+      if (!getProviderModel(selection.providerId, selection.modelId, providers)) {
+        var first = getFirstProviderModel(providers);
+        selection = first
+          ? { providerId: first.provider.id, modelId: first.model.id }
+          : { providerId: "", modelId: "" };
+      }
+      result[mode] = selection;
+    });
+    return result;
+  }
+
+  function cloneModeModels(modeModels) {
+    var result = createEmptyModeModels();
+    MODEL_MODES.forEach(function (mode) {
+      var item = modeModels && modeModels[mode] ? modeModels[mode] : {};
+      result[mode] = {
+        providerId: item.providerId || "",
+        modelId: item.modelId || ""
+      };
+    });
+    return result;
+  }
+
+  function ensureModeModels(config, providers) {
+    config.modeModels = normalizeModeModels(config.modeModels, providers, null);
+    return config.modeModels;
+  }
+
+  function ensureModeModel(mode, providers) {
+    if (MODEL_MODES.indexOf(mode) < 0) {
+      return;
+    }
+    if (!state.config.modeModels) {
+      state.config.modeModels = createEmptyModeModels();
+    }
+    var selection = state.config.modeModels[mode] || { providerId: "", modelId: "" };
+    if (getProviderModel(selection.providerId, selection.modelId, providers)) {
+      return;
+    }
+    var first = getFirstProviderModel(providers);
+    state.config.modeModels[mode] = first
+      ? { providerId: first.provider.id, modelId: first.model.id }
+      : { providerId: "", modelId: "" };
+  }
+
   function formatModelValue(providerId, modelId) {
     if (!providerId || !modelId) {
       return "";
@@ -2040,6 +2126,13 @@
       }
     }
     return null;
+  }
+
+  function getFirstResolvedProviderModel(providers) {
+    var first = getFirstProviderModel(providers || []);
+    return first
+      ? getProviderModel(first.provider.id, first.model.id, providers)
+      : null;
   }
 
   function countModels(providers) {
@@ -2111,12 +2204,7 @@
     });
 
     provider.models = nextModels.length ? nextModels : [createModel()];
-    if (
-      state.config.defaultProviderId === provider.id &&
-      !provider.models.some(function (model) { return model.id === state.config.defaultModelId; })
-    ) {
-      state.config.defaultModelId = provider.models[0].id;
-    }
+    ensureModeModels(state.config, state.draftProviders);
     return addedCount;
   }
 

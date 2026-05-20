@@ -34,6 +34,9 @@
         <main class="main">
           <section class="view is-active" id="taskView">
             <section class="input-panel">
+              <div class="mode-model-row">
+                <select id="taskModelSelect" class="mode-model-select" aria-label="当前模型"></select>
+              </div>
               <textarea id="inputText" spellcheck="false" placeholder="输入内容"></textarea>
               <div id="taskAttachments" class="attachment-list"></div>
               <div class="action-row">
@@ -56,9 +59,12 @@
 
           <section class="view" id="chatView">
             <aside class="sessions-panel">
-              <section class="assistant-section">
+              <section id="assistantSection" class="assistant-section">
                 <div class="sidebar-section-head">
-                  <span>助手</span>
+                  <button id="assistantToggleBtn" class="assistant-toggle" type="button" aria-expanded="false">
+                    <span>助手</span>
+                    <strong id="currentAssistantName">默认助手</strong>
+                  </button>
                   <button id="newAssistantBtn" class="icon-btn compact-btn" type="button" title="新建助手" aria-label="新建助手">+</button>
                 </div>
                 <div id="assistantsList" class="assistants-list"></div>
@@ -66,10 +72,6 @@
                   <label class="field">
                     <span>名称</span>
                     <input id="assistantNameInput" />
-                  </label>
-                  <label class="field">
-                    <span>默认模型</span>
-                    <select id="assistantProviderSelect"></select>
                   </label>
                   <label class="field">
                     <span>Prompt</span>
@@ -90,6 +92,9 @@
             <section class="chat-panel">
               <div id="messagesList" class="messages-list"></div>
               <div class="chat-composer">
+                <div class="mode-model-row">
+                  <select id="assistantProviderSelect" class="mode-model-select" aria-label="当前模型"></select>
+                </div>
                 <textarea id="chatInput" spellcheck="false" placeholder="输入消息"></textarea>
                 <div id="chatAttachments" class="attachment-list"></div>
                 <div class="action-row">
@@ -104,21 +109,11 @@
 
           <section class="view" id="settingsView">
             <div class="settings-layout">
-              <section class="settings-band">
-                <div class="settings-head">
-                  <div>
-                    <h2>默认模型</h2>
-                  </div>
+              <section class="providers-section" aria-labelledby="providersTitle">
+                <div class="providers-head">
+                  <h2 id="providersTitle">Providers</h2>
                   <button id="addProviderBtn" class="icon-btn" type="button" title="新增 provider" aria-label="新增 provider">+</button>
                 </div>
-                <label class="field full-field">
-                  <span>当前使用</span>
-                  <select id="defaultProviderSelect"></select>
-                </label>
-              </section>
-
-              <section class="providers-section" aria-labelledby="providersTitle">
-                <h2 id="providersTitle">Providers</h2>
                 <div id="providersList" class="providers-list"></div>
               </section>
 

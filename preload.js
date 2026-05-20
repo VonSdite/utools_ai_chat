@@ -11,39 +11,49 @@ const CHAT_STORE_KEY = "markmind/chats/v1";
 const REQUEST_TIMEOUT_MS = 120000;
 const MAX_ERROR_BODY = 2000;
 const MAX_DOCUMENT_CHARS = 60000;
+const MODEL_MODES = ["translate", "summary", "explain", "chat"];
 
 let electronSession = null;
 let electronClipboard = null;
+let electronIpcRenderer = null;
 
 try {
   const electron = require("electron");
   electronSession = electron.session || null;
   electronClipboard = electron.clipboard || null;
+  electronIpcRenderer = electron.ipcRenderer || null;
 } catch (error) {
   electronSession = null;
   electronClipboard = null;
+  electronIpcRenderer = null;
 }
 
 let activeRequest = null;
 let activeSocket = null;
 let lastEnterAction = null;
+let standaloneWindow = null;
 const enterListeners = new Set();
 
 if (typeof utools !== "undefined" && utools.onPluginEnter) {
   utools.onPluginEnter((action) => {
-    lastEnterAction = normalizeEnterAction(action);
-    enterListeners.forEach((listener) => {
-      try {
-        listener(lastEnterAction);
-      } catch (error) {
-        console.error(error);
-      }
-    });
+    const normalized = normalizeEnterAction(action);
+    if (shouldUseStandaloneWindow()) {
+      openStandaloneWindow(normalized);
+      lastEnterAction = null;
+      return;
+    }
+    dispatchEnterAction(normalized);
   });
 }
 
 if (typeof utools !== "undefined" && utools.setExpendHeight) {
   utools.setExpendHeight(720);
+}
+
+if (electronIpcRenderer) {
+  electronIpcRenderer.on("markmind-enter-action", (event, action) => {
+    dispatchEnterAction(normalizeEnterAction(action));
+  });
 }
 
 window.markMind = {
@@ -76,6 +86,94 @@ function normalizeEnterAction(action) {
     type: typeof source.type === "string" ? source.type : "",
     payload: source.payload
   };
+}
+
+function dispatchEnterAction(action) {
+  lastEnterAction = action;
+  enterListeners.forEach((listener) => {
+    try {
+      listener(lastEnterAction);
+    } catch (error) {
+      console.error(error);
+    }
+  });
+}
+
+function shouldUseStandaloneWindow() {
+  return (
+    typeof utools !== "undefined" &&
+    typeof utools.createBrowserWindow === "function" &&
+    typeof utools.getWindowType === "function" &&
+    utools.getWindowType() === "main"
+  );
+}
+
+function openStandaloneWindow(action) {
+  const existing = getUsableStandaloneWindow();
+  if (existing) {
+    showStandaloneWindow(existing, action);
+    return;
+  }
+
+  standaloneWindow = utools.createBrowserWindow(
+    "index.html",
+    {
+      show: false,
+      title: "MarkMind",
+      width: 1120,
+      height: 760,
+      minWidth: 900,
+      minHeight: 620,
+      center: true,
+      closeable: true,
+      autoHideMenuBar: true,
+      backgroundColor: "#f4f6f5",
+      webPreferences: {
+        preload: "preload.js"
+      }
+    },
+    () => {
+      setTimeout(() => {
+        showStandaloneWindow(standaloneWindow, action);
+      }, 0);
+    }
+  );
+}
+
+function getUsableStandaloneWindow() {
+  if (!standaloneWindow) {
+    return null;
+  }
+  try {
+    if (typeof standaloneWindow.isDestroyed === "function" && standaloneWindow.isDestroyed()) {
+      standaloneWindow = null;
+      return null;
+    }
+    return standaloneWindow;
+  } catch (error) {
+    standaloneWindow = null;
+    return null;
+  }
+}
+
+function showStandaloneWindow(targetWindow, action) {
+  try {
+    if (targetWindow && typeof targetWindow.show === "function") {
+      targetWindow.show();
+    }
+    if (targetWindow && typeof targetWindow.focus === "function") {
+      targetWindow.focus();
+    }
+    if (targetWindow && targetWindow.webContents) {
+      targetWindow.webContents.send("markmind-enter-action", action);
+    }
+    if (typeof utools !== "undefined" && typeof utools.hideMainWindow === "function") {
+      utools.hideMainWindow(false);
+    }
+  } catch (error) {
+    standaloneWindow = null;
+    throw error;
+  }
 }
 
 function getConfig() {
@@ -120,7 +218,7 @@ async function runTask(payload, onEvent) {
   }
 
   const config = getConfig();
-  const provider = resolveProvider(config, payload && payload.providerId, payload && payload.modelId);
+  const provider = resolveProvider(config, payload && payload.providerId, payload && payload.modelId, mode);
   validateProvider(provider);
   const messages = buildTaskMessages(mode, text, attachments, provider);
   return completeWithMessages(provider, messages, onEvent);
@@ -129,7 +227,7 @@ async function runTask(payload, onEvent) {
 async function sendChat(payload, onEvent) {
   abortActive();
   const config = getConfig();
-  const provider = resolveProvider(config, payload && payload.providerId, payload && payload.modelId);
+  const provider = resolveProvider(config, payload && payload.providerId, payload && payload.modelId, "chat");
   validateProvider(provider);
   const messages = buildChatMessages(payload && payload.messages, provider, payload && payload.assistant);
   if (!messages.length) {
@@ -420,11 +518,18 @@ function normalizeAttachments(attachments) {
     .filter(Boolean);
 }
 
-function resolveProvider(config, providerId, modelId) {
+function resolveProvider(config, providerId, modelId, mode) {
   const providers = Array.isArray(config.providers) ? config.providers : [];
   const requested = resolveProviderModel(providers, providerId, modelId);
   if (requested) {
     return requested;
+  }
+  const modeSelection = config.modeModels && config.modeModels[mode] ? config.modeModels[mode] : null;
+  const modeProvider = modeSelection
+    ? resolveProviderModel(providers, modeSelection.providerId, modeSelection.modelId)
+    : null;
+  if (modeProvider) {
+    return modeProvider;
   }
   const fallback = resolveProviderModel(providers, config.defaultProviderId, config.defaultModelId);
   if (fallback) {
@@ -1242,12 +1347,40 @@ function normalizeConfig(config) {
     defaultProviderId = first ? first.id : "";
     defaultModelId = first ? first.modelId : "";
   }
+  const modeModels = normalizeModeModels(
+    source.modeModels,
+    providers,
+    { providerId: defaultProviderId, modelId: defaultModelId }
+  );
 
   return {
     providers,
     defaultProviderId: providers.length ? defaultProviderId : "",
-    defaultModelId: providers.length ? defaultModelId : ""
+    defaultModelId: providers.length ? defaultModelId : "",
+    modeModels
   };
+}
+
+function normalizeModeModels(source, providers, fallbackSelection) {
+  const result = {};
+  for (const mode of MODEL_MODES) {
+    const item = source && typeof source === "object" ? source[mode] : null;
+    let selection = {
+      providerId: item && typeof item.providerId === "string" ? item.providerId : "",
+      modelId: item && typeof item.modelId === "string" ? item.modelId : ""
+    };
+    if (!resolveProviderModel(providers, selection.providerId, selection.modelId)) {
+      selection = fallbackSelection || { providerId: "", modelId: "" };
+    }
+    if (!resolveProviderModel(providers, selection.providerId, selection.modelId)) {
+      const first = getFirstProviderModel(providers);
+      selection = first
+        ? { providerId: first.id, modelId: first.modelId }
+        : { providerId: "", modelId: "" };
+    }
+    result[mode] = selection;
+  }
+  return result;
 }
 
 function normalizeProvider(provider) {
@@ -1355,7 +1488,7 @@ function normalizeAssistant(assistant) {
     id: typeof assistant.id === "string" && assistant.id
       ? assistant.id
       : createStorageId("assistant"),
-    name: typeof assistant.name === "string" && assistant.name ? assistant.name : "新助手",
+    name: typeof assistant.name === "string" && assistant.name ? assistant.name : "默认助手",
     prompt: typeof assistant.prompt === "string" ? assistant.prompt : "",
     providerId: typeof assistant.providerId === "string" ? assistant.providerId : "",
     modelId: typeof assistant.modelId === "string" ? assistant.modelId : "",
@@ -1374,6 +1507,8 @@ function normalizeSession(session) {
   return {
     id: typeof session.id === "string" && session.id ? session.id : createStorageId("session"),
     title: typeof session.title === "string" && session.title ? session.title : "新会话",
+    providerId: typeof session.providerId === "string" ? session.providerId : "",
+    modelId: typeof session.modelId === "string" ? session.modelId : "",
     createdAt: Number(session.createdAt) || Date.now(),
     updatedAt: Number(session.updatedAt) || Date.now(),
     messages: Array.isArray(session.messages)
