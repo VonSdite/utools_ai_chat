@@ -88,3 +88,13 @@ https://api.example.com/v1/chat/completions
 - 文本、代码、PDF、DOC、DOCX、PPTX、XLSX、ODT、ODP、ODS 会先提取文本，再作为上下文随消息发送。
 - 文档原文件和提取后的文本会缓存到数据目录下的 `cache/attachments`，会话里保存用于发送的文本快照。
 - 数据目录可在设置中修改；Windows 默认是 `D:\utools_ai_agent`，macOS/Linux 默认是 `~/utools_ai_agent`。
+
+## 发布目录
+
+发布前执行：
+
+```bash
+npm run release:utools
+```
+
+脚本会生成 `dist/utools`，只复制插件运行需要的页面、脚本、图标、`vendor` 资源，并在发布目录安装 preload 运行依赖。uTools 发布时选择 `dist/utools` 目录即可。

@@ -4,7 +4,8 @@
   "private": true,
   "description": "AI Agent is a uTools AI assistant for chat, translation, summaries, and explanations.",
   "scripts": {
-    "check": "node --check preload.js && node --check index.js"
+    "check": "node --check preload.js && node --check index.js",
+    "release:utools": "node scripts/prepare-utools-release.js"
   },
   "dependencies": {
     "chardet": "^2.1.1",
