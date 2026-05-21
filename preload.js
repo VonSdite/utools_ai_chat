@@ -129,6 +129,7 @@ window.markMind = {
   readImageAttachments,
   chooseDataDirectory,
   chooseAttachmentFiles,
+  getUser,
   onEnter(listener) {
     enterListeners.add(listener);
     return () => enterListeners.delete(listener);
@@ -463,6 +464,13 @@ function getClipboardText() {
     return navigator.clipboard.readText();
   }
   return "";
+}
+
+function getUser() {
+  if (typeof utools !== "undefined" && typeof utools.getUser === "function") {
+    return utools.getUser();
+  }
+  return null;
 }
 
 function getRecentClipboardText(maxAgeMs) {

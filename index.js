@@ -14,6 +14,7 @@
   var SEARCH_RESULT_LIMIT = 30;
   var SEARCH_DEBOUNCE_MS = 120;
   var MAX_CHAT_RUNS = 3;
+  var INTERNAL_IMAGE_PASTE_ENTER_WINDOW_MS = 1500;
   var TASKS = {
     translate: { title: "翻译", action: "翻译", placeholder: "把小纸条放这里，我来认真读" },
     summary: { title: "总结", action: "总结", placeholder: "把长长的内容放这里，我来帮你收成重点" },
@@ -63,6 +64,7 @@
       proxyMode: DEFAULT_PROXY_MODE,
       proxyUrl: ""
     },
+    userProfile: null,
     draftProviders: [],
     activeTab: "chat",
     activeTaskMode: "translate",
@@ -103,6 +105,7 @@
     selectionSpeechTimer: 0,
     taskRunId: "",
     runningTaskMode: "",
+    internalImagePasteAt: 0,
     toastTimer: 0
   };
 
@@ -113,6 +116,7 @@
   async function init() {
     cacheElements();
     bindEvents();
+    await loadUserProfile();
     await loadConfig();
     await loadChatStore();
     await loadTaskStore();
@@ -284,17 +288,28 @@
       }
       handleSubmitKeydown(event, sendChatMessage);
     });
-    els.chatInput.addEventListener("input", updateChatSlashMenu);
+    els.chatInput.addEventListener("input", function () {
+      updateChatSlashMenu();
+      hideSelectionSpeechButton();
+    });
+    els.chatInput.addEventListener("select", scheduleSelectionSpeechButtonUpdate);
+    els.chatInput.addEventListener("mouseup", scheduleSelectionSpeechButtonUpdate);
+    els.chatInput.addEventListener("keyup", scheduleSelectionSpeechButtonUpdate);
+    els.chatInput.addEventListener("scroll", hideSelectionSpeechButton);
     els.chatInput.addEventListener("blur", function () {
       window.setTimeout(closeChatSlashMenu, 120);
     });
     els.chatSlashMenu.addEventListener("mousedown", function (event) {
-      event.preventDefault();
+      if (event.target.closest("[data-slash-index]")) {
+        event.preventDefault();
+      }
     });
     els.chatSlashMenu.addEventListener("click", handleChatSlashClick);
     els.chatInput.addEventListener("paste", handleChatPaste);
     els.messagesList.addEventListener("click", handleReasoningSummaryClick);
     els.messagesList.addEventListener("click", handleCodeCopyClick);
+    els.messagesList.addEventListener("mouseup", scheduleSelectionSpeechButtonUpdate);
+    els.messagesList.addEventListener("scroll", hideSelectionSpeechButton);
     els.resultText.addEventListener("click", handleCodeCopyClick);
     els.resultText.addEventListener("mouseup", scheduleSelectionSpeechButtonUpdate);
     els.resultText.addEventListener("scroll", hideSelectionSpeechButton);
@@ -418,6 +433,7 @@
     });
     document.addEventListener("selectionchange", scheduleSelectionSpeechButtonUpdate);
     document.addEventListener("mousedown", handleDocumentMouseDownForSelectionSpeech);
+    document.addEventListener("paste", markInternalImagePaste, true);
     window.addEventListener("resize", hideSelectionSpeechButton);
 
     els.sideTabs.forEach(function (tab) {
@@ -433,6 +449,18 @@
       state.draftProviders = cloneProviders(state.config.providers);
     } catch (error) {
       showToast("读取设置失败：" + getErrorMessage(error));
+    }
+  }
+
+  async function loadUserProfile() {
+    if (!api.getUser) {
+      state.userProfile = null;
+      return;
+    }
+    try {
+      state.userProfile = normalizeUserProfile(await api.getUser());
+    } catch (error) {
+      state.userProfile = null;
     }
   }
 
@@ -456,6 +484,9 @@
 
   async function handlePluginEnter(action) {
     if (!action) {
+      return;
+    }
+    if (shouldIgnoreInternalImagePasteEnter(action)) {
       return;
     }
 
@@ -544,6 +575,13 @@
       return commandTab;
     }
     return tabFromActionCode(action && action.code) || "translate";
+  }
+
+  function shouldIgnoreInternalImagePasteEnter(action) {
+    if (!action || action.type !== "img") {
+      return false;
+    }
+    return Date.now() - state.internalImagePasteAt <= INTERNAL_IMAGE_PASTE_ENTER_WINDOW_MS;
   }
 
   function tabFromActionCode(code) {
@@ -1215,41 +1253,52 @@
   }
 
   function canUseSelectionSpeech() {
-    return state.activeTab === "task" && state.activeTaskMode === "translate";
+    return state.activeTab === "task" || state.activeTab === "chat";
   }
 
   function getSelectionSpeechTarget() {
-    return getTextareaSpeechSelection() || getOutputSpeechSelection();
+    return getTextareaSpeechSelection() || getDocumentSpeechSelection();
   }
 
   function getTextareaSpeechSelection() {
-    if (document.activeElement !== els.inputText) {
+    var textarea = getActiveSpeechTextarea();
+    if (!textarea) {
       return null;
     }
-    var start = els.inputText.selectionStart;
-    var end = els.inputText.selectionEnd;
+    var start = textarea.selectionStart;
+    var end = textarea.selectionEnd;
     if (typeof start !== "number" || typeof end !== "number" || start === end) {
       return null;
     }
 
     var from = Math.min(start, end);
     var to = Math.max(start, end);
-    var text = normalizeSelectionSpeechText(els.inputText.value.slice(from, to));
+    var text = normalizeSelectionSpeechText(textarea.value.slice(from, to));
     if (!text) {
       return null;
     }
 
     return {
       text: text,
-      rect: getTextareaSelectionRect(els.inputText)
+      rect: getTextareaSelectionRect(textarea, from, to)
     };
   }
 
-  function getTextareaSelectionRect(textarea) {
+  function getActiveSpeechTextarea() {
+    if (state.activeTab === "task" && document.activeElement === els.inputText) {
+      return els.inputText;
+    }
+    if (state.activeTab === "chat" && document.activeElement === els.chatInput) {
+      return els.chatInput;
+    }
+    return null;
+  }
+
+  function getTextareaSelectionRect(textarea, from, to) {
     var textareaRect = textarea.getBoundingClientRect();
     var style = window.getComputedStyle(textarea);
     var mirror = document.createElement("div");
-    var marker = document.createElement("span");
+    var selected = document.createElement("span");
     var properties = [
       "boxSizing",
       "borderTopWidth",
@@ -1285,27 +1334,24 @@
     mirror.style.whiteSpace = "pre-wrap";
     mirror.style.overflowWrap = "break-word";
     mirror.style.overflow = "hidden";
-    mirror.textContent = textarea.value.slice(0, textarea.selectionEnd);
-    marker.textContent = "\u200b";
-    mirror.appendChild(marker);
+    mirror.textContent = textarea.value.slice(0, from);
+    selected.textContent = textarea.value.slice(from, to) || "\u200b";
+    mirror.appendChild(selected);
     document.body.appendChild(mirror);
 
-    var markerRect = marker.getBoundingClientRect();
+    var selectionRect = getLastVisibleRect(Array.from(selected.getClientRects())) || selected.getBoundingClientRect();
     document.body.removeChild(mirror);
 
-    var lineHeight = parseFloat(style.lineHeight) || parseFloat(style.fontSize) * 1.55 || 20;
-    var left = markerRect.left - textarea.scrollLeft;
-    var top = markerRect.top - textarea.scrollTop;
     return {
-      left: left,
-      right: left,
-      top: top,
-      bottom: top + lineHeight
+      left: selectionRect.left - textarea.scrollLeft,
+      right: selectionRect.right - textarea.scrollLeft,
+      top: selectionRect.top - textarea.scrollTop,
+      bottom: selectionRect.bottom - textarea.scrollTop
     };
   }
 
-  function getOutputSpeechSelection() {
-    if (!state.currentResult || !window.getSelection) {
+  function getDocumentSpeechSelection() {
+    if (!window.getSelection) {
       return null;
     }
     var selection = window.getSelection();
@@ -1314,7 +1360,11 @@
     }
 
     var range = selection.getRangeAt(0);
-    if (!isNodeInside(els.resultText, range.commonAncestorContainer)) {
+    var container = getSelectionSpeechContainer(range.commonAncestorContainer);
+    if (!container) {
+      return null;
+    }
+    if (container === els.resultText && !state.currentResult) {
       return null;
     }
 
@@ -1329,14 +1379,35 @@
     };
   }
 
+  function getSelectionSpeechContainer(node) {
+    var containers = getSelectionSpeechContainers();
+    for (var index = 0; index < containers.length; index += 1) {
+      if (isNodeInside(containers[index], node)) {
+        return containers[index];
+      }
+    }
+    return null;
+  }
+
+  function getSelectionSpeechContainers() {
+    if (state.activeTab === "task") {
+      return [els.resultText];
+    }
+    if (state.activeTab === "chat") {
+      return [els.messagesList];
+    }
+    return [];
+  }
+
   function getRangeSelectionRect(range) {
-    var rects = Array.from(range.getClientRects()).filter(function (rect) {
+    return getLastVisibleRect(Array.from(range.getClientRects())) || range.getBoundingClientRect();
+  }
+
+  function getLastVisibleRect(rects) {
+    var visibleRects = rects.filter(function (rect) {
       return rect.width > 0 || rect.height > 0;
     });
-    if (rects.length) {
-      return rects[rects.length - 1];
-    }
-    return range.getBoundingClientRect();
+    return visibleRects.length ? visibleRects[visibleRects.length - 1] : null;
   }
 
   function isNodeInside(container, node) {
@@ -1366,18 +1437,22 @@
 
     var width = button.offsetWidth || 32;
     var height = button.offsetHeight || 32;
-    var left = rect.right + 6;
-    var top = rect.top - height - 6;
+    var rectWidth = Number.isFinite(rect.width) ? rect.width : rect.right - rect.left;
+    var rectHeight = Number.isFinite(rect.height) ? rect.height : rect.bottom - rect.top;
+    var rectCenter = rect.left + Math.max(rectWidth || 0, 1) / 2;
+    var rightSideLeft = rect.right + 4;
+    var left = rightSideLeft;
+    var top = rect.top + (Math.max(rectHeight || 0, 1) - height) / 2;
 
-    if (left + width + margin > window.innerWidth) {
-      left = rect.left - width - 6;
+    if (rightSideLeft + width + margin > window.innerWidth) {
+      left = rectCenter - width / 2;
+      top = rect.top - height - 4;
+      if (top < margin) {
+        top = rect.bottom + 4;
+      }
     }
-    if (left < margin) {
-      left = Math.min(Math.max(rect.left, margin), window.innerWidth - width - margin);
-    }
-    if (top < margin) {
-      top = rect.bottom + 6;
-    }
+    left = Math.min(Math.max(left, margin), window.innerWidth - width - margin);
+    top = Math.max(top, margin);
     if (top + height + margin > window.innerHeight) {
       top = Math.max(margin, window.innerHeight - height - margin);
     }
@@ -1392,10 +1467,22 @@
     if (target && target.closest && target.closest("#selectionSpeakBtn")) {
       return;
     }
-    if (target === els.inputText || isNodeInside(els.resultText, target)) {
+    if (isSelectionSpeechSurface(target)) {
       return;
     }
     hideSelectionSpeechButton();
+  }
+
+  function isSelectionSpeechSurface(target) {
+    if (!target) {
+      return false;
+    }
+    if (target === els.inputText || target === els.chatInput) {
+      return true;
+    }
+    return getSelectionSpeechContainers().some(function (container) {
+      return isNodeInside(container, target);
+    });
   }
 
   function detectSpeechLanguage(text) {
@@ -1511,10 +1598,31 @@
   }
 
   function handleChatSlashKeydown(event) {
-    if (state.chatSlashMode !== "model") {
+    var isModelMode = state.chatSlashMode === "model";
+    if (!isModelMode) {
       updateChatSlashMenu();
     }
-    if (!state.chatSlashCommands.length || els.chatSlashMenu.hidden) {
+
+    var menuOpen = Boolean(els.chatSlashMenu && !els.chatSlashMenu.hidden);
+    if (!state.chatSlashCommands.length || !menuOpen) {
+      if (isModelMode && menuOpen) {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          closeChatSlashMenu();
+          return true;
+        }
+        if (
+          event.key === "ArrowDown" ||
+          event.key === "ArrowUp" ||
+          event.key === "Home" ||
+          event.key === "End" ||
+          event.key === "Tab" ||
+          (event.key === "Enter" && !event.shiftKey && !event.isComposing)
+        ) {
+          event.preventDefault();
+          return true;
+        }
+      }
       return false;
     }
 
@@ -1554,15 +1662,18 @@
       return true;
     }
 
-    if (state.chatSlashMode === "model") {
-      closeChatSlashMenu();
-    }
     return false;
   }
 
   function updateChatSlashMenu() {
     if (state.chatSlashMode === "model") {
-      closeChatSlashMenu();
+      updateChatModelSlashMenu();
+      return;
+    }
+
+    if (getInlineChatModelSlashQuery() !== null) {
+      openChatModelSelect({ preserveInput: true });
+      return;
     }
 
     var query = getChatSlashQuery();
@@ -1612,6 +1723,39 @@
     return before.slice(1).toLocaleLowerCase();
   }
 
+  function getInlineChatModelSlashQuery() {
+    var input = getChatInputBeforeCursor();
+    if (!input) {
+      return null;
+    }
+    var match = input.before.match(/^\/model(?:\s+(.*)|\s)$/i);
+    return match ? match[1] || "" : null;
+  }
+
+  function getChatInputBeforeCursor() {
+    if (!els.chatInput) {
+      return null;
+    }
+
+    var value = els.chatInput.value || "";
+    var selectionStart = typeof els.chatInput.selectionStart === "number"
+      ? els.chatInput.selectionStart
+      : value.length;
+    var selectionEnd = typeof els.chatInput.selectionEnd === "number"
+      ? els.chatInput.selectionEnd
+      : selectionStart;
+    if (selectionStart !== selectionEnd) {
+      return null;
+    }
+
+    var before = value.slice(0, selectionStart);
+    var after = value.slice(selectionStart);
+    if (after.trim()) {
+      return null;
+    }
+    return { before: before, after: after };
+  }
+
   function getMatchingChatSlashCommands(query) {
     var value = String(query || "").toLocaleLowerCase();
     return CHAT_SLASH_COMMANDS
@@ -1627,11 +1771,19 @@
   function renderChatSlashMenu() {
     var commands = state.chatSlashCommands || [];
     if (!commands.length) {
+      if (state.chatSlashMode === "model") {
+        els.chatSlashMenu.hidden = false;
+        els.chatSlashMenu.classList.add("is-model-menu");
+        els.chatInput.setAttribute("aria-expanded", "true");
+        els.chatSlashMenu.innerHTML = '<div class="slash-command-empty">没有匹配模型</div>';
+        return;
+      }
       closeChatSlashMenu();
       return;
     }
 
     els.chatSlashMenu.hidden = false;
+    els.chatSlashMenu.classList.toggle("is-model-menu", state.chatSlashMode === "model");
     els.chatInput.setAttribute("aria-expanded", "true");
     els.chatSlashMenu.innerHTML = commands
       .map(function (item, index) {
@@ -1671,6 +1823,7 @@
     state.chatSlashCommandIndex = 0;
     if (els.chatSlashMenu) {
       els.chatSlashMenu.hidden = true;
+      els.chatSlashMenu.classList.remove("is-model-menu");
       els.chatSlashMenu.innerHTML = "";
     }
     if (els.chatInput) {
@@ -1745,30 +1898,72 @@
     }
   }
 
-  function openChatModelSelect() {
+  function openChatModelSelect(options) {
+    var opts = options || {};
     ensureActiveAssistantAndSession();
     renderChatModelSelect();
 
-    var models = getChatModelSlashCommands();
-    if (!models.length) {
+    if (!getChatModelSlashCommands("").length) {
       showToast("没有可选模型");
       els.chatInput.focus();
       return;
     }
 
-    var selectedIndex = models.findIndex(function (item) {
-      return item.current;
-    });
+    if (!opts.preserveInput) {
+      els.chatInput.value = "";
+    }
+    state.chatSlashMode = "model";
+    updateChatModelSlashMenu({ preferCurrent: true });
+    els.chatInput.focus();
+  }
+
+  function updateChatModelSlashMenu(options) {
+    var opts = options || {};
+    var query = getChatModelSlashFilterQuery();
+    if (query === null) {
+      closeChatSlashMenu();
+      updateChatSlashMenu();
+      return;
+    }
+
+    var previous = state.chatSlashCommands[state.chatSlashCommandIndex];
+    var previousValue = previous && previous.value ? previous.value : "";
+    var models = getChatModelSlashCommands(query);
+    var selectedIndex = -1;
+    if (previousValue) {
+      selectedIndex = models.findIndex(function (item) {
+        return item.value === previousValue;
+      });
+    }
+    if (selectedIndex < 0 && opts.preferCurrent) {
+      selectedIndex = models.findIndex(function (item) {
+        return item.current;
+      });
+    }
+
     state.chatSlashMode = "model";
     state.chatSlashCommands = models;
     state.chatSlashCommandIndex = selectedIndex >= 0 ? selectedIndex : 0;
     renderChatSlashMenu();
-    els.chatInput.focus();
   }
 
-  function getChatModelSlashCommands() {
+  function getChatModelSlashFilterQuery() {
+    var input = getChatInputBeforeCursor();
+    if (!input) {
+      return null;
+    }
+    var before = input.before;
+    if (before.charAt(0) === "/") {
+      var inlineQuery = getInlineChatModelSlashQuery();
+      return inlineQuery === null ? null : inlineQuery;
+    }
+    return before.trim();
+  }
+
+  function getChatModelSlashCommands(query) {
     var providers = state.config.providers || [];
     var currentValue = els.assistantProviderSelect ? els.assistantProviderSelect.value : "";
+    var queryTokens = getSlashFilterTokens(query);
     var items = [];
 
     providers.forEach(function (provider) {
@@ -1778,12 +1973,17 @@
         }
 
         var value = formatModelValue(provider.id, model.id);
+        var title = (provider.name || "未命名 provider") + " / " + (model.model || "未设置模型");
+        var searchText = [provider.name, model.model, provider.id, model.id, value].join(" ");
+        if (!slashFilterMatches(searchText, queryTokens)) {
+          return;
+        }
         items.push({
           kind: "model",
           id: "model",
           value: value,
           command: value === currentValue ? "当前" : "模型",
-          title: (provider.name || "未命名 provider") + " / " + (model.model || "未设置模型"),
+          title: title,
           current: value === currentValue
         });
       });
@@ -1792,12 +1992,31 @@
     return items;
   }
 
+  function getSlashFilterTokens(value) {
+    return String(value || "")
+      .trim()
+      .toLocaleLowerCase()
+      .split(/\s+/)
+      .filter(Boolean);
+  }
+
+  function slashFilterMatches(value, tokens) {
+    if (!tokens.length) {
+      return true;
+    }
+    var text = String(value || "").toLocaleLowerCase();
+    return tokens.every(function (token) {
+      return text.indexOf(token) >= 0;
+    });
+  }
+
   function selectChatSlashModel(command) {
     if (!command || !command.value) {
       return;
     }
 
     updateModeModel("chat", command.value);
+    els.chatInput.value = "";
     closeChatSlashMenu();
     els.chatInput.focus();
     var provider = getChatProvider(getActiveAssistant());
@@ -1991,6 +2210,27 @@
 
   function isOcrTaskMode() {
     return state.activeTaskMode === "ocr";
+  }
+
+  function markInternalImagePaste(event) {
+    if (!event || !isEditablePasteTarget(event.target) || !getClipboardImageFiles(event).length) {
+      return;
+    }
+    state.internalImagePasteAt = Date.now();
+  }
+
+  function isEditablePasteTarget(target) {
+    if (!target || target === document.body) {
+      return false;
+    }
+    if (target === els.inputText || target === els.chatInput) {
+      return true;
+    }
+    if (target.isContentEditable) {
+      return true;
+    }
+    var tagName = String(target.tagName || "").toLowerCase();
+    return tagName === "textarea" || tagName === "input";
   }
 
   function handleChatPaste(event) {
@@ -2833,6 +3073,7 @@
     var loadingHtml = isAssistant && message.loading ? renderMessageLoader() : "";
     var cancelledHtml = isAssistant && message.cancelled ? renderCancelDivider() : "";
     var statsHtml = isAssistant ? renderMessageStats(message) : "";
+    var avatarHtml = renderMessageAvatar(message.role);
     var attachmentHtml = attachments.length
       ? '<div class="message-attachments">' +
         attachments
@@ -2856,11 +3097,15 @@
         "</div>"
       : "";
     return (
+      '<div class="message-row ' +
+      escapeAttr(message.role) +
+      '" data-message-id="' +
+      escapeAttr(message.id) +
+      '">' +
+      avatarHtml +
       '<div class="message ' +
       escapeAttr(message.role) +
       (message.loading ? " is-loading" : "") +
-      '" data-message-id="' +
-      escapeAttr(message.id) +
       '">' +
       modelMetaHtml +
       reasoningHtml +
@@ -2873,8 +3118,34 @@
       cancelledHtml +
       attachmentHtml +
       statsHtml +
+      "</div>" +
       "</div>"
     );
+  }
+
+  function renderMessageAvatar(role) {
+    if (role === "assistant") {
+      return (
+        '<span class="message-avatar assistant-avatar" aria-hidden="true">' +
+        '<img src="logo.svg" alt="" />' +
+        "</span>"
+      );
+    }
+    return renderUserAvatar();
+  }
+
+  function renderUserAvatar() {
+    var avatar = state.userProfile ? normalizeAvatarUrl(state.userProfile.avatar) : "";
+    if (avatar) {
+      return (
+        '<span class="message-avatar user-avatar" aria-hidden="true">' +
+        '<img src="' +
+        escapeAttr(avatar) +
+        '" alt="" />' +
+        "</span>"
+      );
+    }
+    return '<span class="message-avatar user-avatar user-avatar-fallback" aria-hidden="true"></span>';
   }
 
   async function handleCodeCopyClick(event) {
@@ -3015,17 +3286,28 @@
       return;
     }
 
-    event.preventDefault();
     var details = summary.parentElement;
     var messageNode = summary.closest("[data-message-id]");
     var message = messageNode ? findMessageById(getActiveSession(), messageNode.dataset.messageId) : null;
     var nextOpen = !details.open;
 
-    details.open = nextOpen;
     if (message) {
       message._reasoningOpen = nextOpen;
     }
-    if (nextOpen && messageNode) {
+    window.setTimeout(function () {
+      syncReasoningOpenState(details, messageNode, message);
+    }, 0);
+  }
+
+  function syncReasoningOpenState(details, messageNode, message) {
+    if (!details || !messageNode || !els.messagesList.contains(messageNode)) {
+      return;
+    }
+    var isOpen = Boolean(details.open);
+    if (message) {
+      message._reasoningOpen = isOpen;
+    }
+    if (isOpen) {
       scrollReasoningToLatest(messageNode);
     }
   }
@@ -5036,9 +5318,6 @@
         renderTaskModelSelect();
         renderChatModelSelect();
       }
-      if (settings.showSuccess && saveToken === state.settingsSaveToken) {
-        showToast("保存成功");
-      }
       return true;
     } catch (error) {
       showToast("保存没成功：" + getErrorMessage(error));
@@ -5171,6 +5450,24 @@
       providers: providers,
       modeModels: modeModels
     };
+  }
+
+  function normalizeUserProfile(user) {
+    if (!user || typeof user !== "object") {
+      return null;
+    }
+    return {
+      avatar: normalizeAvatarUrl(user.avatar),
+      nickname: String(user.nickname || user.name || "").trim()
+    };
+  }
+
+  function normalizeAvatarUrl(value) {
+    var avatar = String(value || "").trim();
+    if (/^data:image\/[a-z0-9.+-]+;base64,/i.test(avatar)) {
+      return avatar;
+    }
+    return /^https?:\/\//i.test(avatar) ? avatar : "";
   }
 
   function normalizeDataDir(value) {
@@ -6368,6 +6665,9 @@
       },
       abortActive: function () {},
       abortChat: function () {},
+      getUser: function () {
+        return null;
+      },
       onOut: function () {},
       copyText: function (text) {
         return navigator.clipboard.writeText(text);

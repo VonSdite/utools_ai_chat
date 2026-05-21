@@ -144,9 +144,6 @@
             <section class="chat-panel">
               <div id="messagesList" class="messages-list"></div>
               <div class="chat-composer">
-                <div class="mode-model-row">
-                  <select id="assistantProviderSelect" class="mode-model-select" aria-label="当前模型"></select>
-                </div>
                 <div class="chat-input-wrap">
                   <textarea id="chatInput" spellcheck="false" placeholder="想问什么，悄悄告诉我" aria-controls="chatSlashMenu" aria-expanded="false"></textarea>
                   <div id="chatSlashMenu" class="chat-slash-menu" role="listbox" hidden></div>
@@ -195,6 +192,7 @@
                     </svg>
                   </button>
                   <span class="action-spacer" aria-hidden="true"></span>
+                  <select id="assistantProviderSelect" class="mode-model-select chat-action-model-select" aria-label="当前模型"></select>
                   <button id="stopChatBtn" class="icon-btn compact-btn stop-action-btn" type="button" title="停止" aria-label="停止" disabled>
                     <svg class="tool-icon" width="18" height="18" viewBox="0 0 24 24" aria-hidden="true">
                       <rect width="12" height="12" x="6" y="6" rx="2" />
