@@ -22,6 +22,33 @@ const RUNTIME_FILES = [
 
 const RUNTIME_DIRS = ["vendor"];
 const RUNTIME_DEPENDENCIES = ["chardet", "iconv-lite", "officeparser", "word-extractor"];
+const UNUSED_OFFICEPARSER_OCR_PACKAGES = [
+  "bmp-js",
+  "idb-keyval",
+  "is-url",
+  "node-fetch",
+  "opencollective-postinstall",
+  "regenerator-runtime",
+  "tesseract.js",
+  "tesseract.js-core",
+  "wasm-feature-detect",
+  "zlibjs"
+];
+const UNUSED_PDFJS_PATHS = [
+  "build",
+  "iccs",
+  "image_decoders",
+  "types",
+  "wasm",
+  "web",
+  path.join("legacy", "image_decoders"),
+  path.join("legacy", "web"),
+  path.join("legacy", "build", "pdf.d.mts"),
+  path.join("legacy", "build", "pdf.min.mjs"),
+  path.join("legacy", "build", "pdf.sandbox.min.mjs"),
+  path.join("legacy", "build", "pdf.sandbox.mjs"),
+  path.join("legacy", "build", "pdf.worker.min.mjs")
+];
 
 main();
 
@@ -35,6 +62,8 @@ function main() {
     console.log("Skipped dependency install. Run npm install inside dist/utools before publishing.");
   } else {
     installRuntimeDependencies();
+    removeUnusedRuntimeDependencies();
+    prunePdfJsRuntimeFiles();
     removeTemporaryPackageFiles();
   }
 
@@ -104,6 +133,7 @@ function installRuntimeDependencies() {
     [
       "install",
       "--omit=dev",
+      "--omit=optional",
       "--ignore-scripts",
       "--no-audit",
       "--no-fund",
@@ -111,13 +141,46 @@ function installRuntimeDependencies() {
     ],
     {
       cwd: OUT_DIR,
-      stdio: "inherit"
+      stdio: "inherit",
+      shell: process.platform === "win32"
     }
   );
 
   if (result.status !== 0) {
     throw new Error("Failed to install release dependencies.");
   }
+}
+
+function removeUnusedRuntimeDependencies() {
+  const nodeModulesDir = path.join(OUT_DIR, "node_modules");
+  UNUSED_OFFICEPARSER_OCR_PACKAGES.forEach((packageName) => {
+    fs.rmSync(path.join(nodeModulesDir, packageName), { recursive: true, force: true });
+  });
+}
+
+function prunePdfJsRuntimeFiles() {
+  const pdfJsDir = path.join(OUT_DIR, "node_modules", "pdfjs-dist");
+  UNUSED_PDFJS_PATHS.forEach((relativePath) => {
+    fs.rmSync(path.join(pdfJsDir, relativePath), { recursive: true, force: true });
+  });
+  removeFilesByExtension(pdfJsDir, ".map");
+}
+
+function removeFilesByExtension(dir, extension) {
+  if (!fs.existsSync(dir)) {
+    return;
+  }
+
+  fs.readdirSync(dir, { withFileTypes: true }).forEach((entry) => {
+    const entryPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      removeFilesByExtension(entryPath, extension);
+      return;
+    }
+    if (entry.isFile() && entry.name.endsWith(extension)) {
+      fs.rmSync(entryPath, { force: true });
+    }
+  });
 }
 
 function removeTemporaryPackageFiles() {
