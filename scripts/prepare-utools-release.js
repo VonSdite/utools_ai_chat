@@ -4,6 +4,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
+const esbuild = require("esbuild");
 
 const ROOT_DIR = path.resolve(__dirname, "..");
 const OUT_DIR = path.join(ROOT_DIR, "dist", "utools");
@@ -23,18 +24,36 @@ const RUNTIME_FILES = [
 const RUNTIME_DIRS = ["vendor"];
 const RUNTIME_DEPENDENCIES = ["chardet", "iconv-lite", "officeparser", "word-extractor"];
 const UNUSED_OFFICEPARSER_OCR_PACKAGES = [
+  "@borewit",
+  "@tokenizer",
   "bmp-js",
+  "file-type",
   "idb-keyval",
+  "ieee754",
   "is-url",
   "node-fetch",
   "opencollective-postinstall",
   "regenerator-runtime",
   "tesseract.js",
   "tesseract.js-core",
+  "token-types",
+  "tr46",
+  "strtok3",
+  "uint8array-extras",
   "wasm-feature-detect",
+  "webidl-conversions",
+  "whatwg-url",
   "zlibjs"
 ];
+const UNUSED_FFLATE_PATHS = [
+  "esm",
+  "umd",
+  path.join("lib", "browser.cjs"),
+  path.join("lib", "worker.cjs")
+];
 const UNUSED_PDFJS_PATHS = [
+  "CODE_OF_CONDUCT.md",
+  "README.md",
   "build",
   "cmaps",
   "iccs",
@@ -43,8 +62,10 @@ const UNUSED_PDFJS_PATHS = [
   "types",
   "wasm",
   "web",
+  "webpack.mjs",
   path.join("legacy", "image_decoders"),
   path.join("legacy", "web"),
+  path.join("legacy", "webpack.mjs"),
   path.join("legacy", "build", "pdf.d.mts"),
   path.join("legacy", "build", "pdf.min.mjs"),
   path.join("legacy", "build", "pdf.sandbox.min.mjs"),
@@ -59,6 +80,16 @@ const UNUSED_OFFICEPARSER_PATHS = [
   path.join("dist", "sbom.cdx.json")
 ];
 const UNUSED_RELEASE_SUFFIXES = [".d.ts", ".d.mts", ".d.cts", ".map", ".js.gz"];
+const UNUSED_RELEASE_DOC_NAMES = [
+  "changelog",
+  "code_of_conduct",
+  "history",
+  "porting-buffer",
+  "readme",
+  "security"
+];
+const UNUSED_RELEASE_TEST_DIRS = ["__tests__", "test", "tests"];
+const MINIFY_SCRIPT_EXTENSIONS = [".cjs", ".js", ".mjs"];
 
 main();
 
@@ -73,9 +104,13 @@ function main() {
   } else {
     installRuntimeDependencies();
     removeUnusedRuntimeDependencies();
+    pruneFflateRuntimeFiles();
     pruneOfficeParserRuntimeFiles();
     prunePdfJsRuntimeFiles();
     pruneUnusedReleaseFiles();
+    pruneUnusedReleaseDocs();
+    pruneUnusedReleaseTests();
+    minifyRuntimeScripts();
     removeTemporaryPackageFiles();
   }
 
@@ -170,11 +205,38 @@ function removeUnusedRuntimeDependencies() {
   });
 }
 
+function pruneFflateRuntimeFiles() {
+  const fflateDir = path.join(OUT_DIR, "node_modules", "fflate");
+  UNUSED_FFLATE_PATHS.forEach((relativePath) => {
+    fs.rmSync(path.join(fflateDir, relativePath), { recursive: true, force: true });
+  });
+}
+
 function prunePdfJsRuntimeFiles() {
   const pdfJsDir = path.join(OUT_DIR, "node_modules", "pdfjs-dist");
+  useMinifiedPdfJsRuntimeFiles(pdfJsDir);
   UNUSED_PDFJS_PATHS.forEach((relativePath) => {
     fs.rmSync(path.join(pdfJsDir, relativePath), { recursive: true, force: true });
   });
+}
+
+function useMinifiedPdfJsRuntimeFiles(pdfJsDir) {
+  copyMinifiedRuntimeFile(
+    path.join(pdfJsDir, "legacy", "build", "pdf.min.mjs"),
+    path.join(pdfJsDir, "legacy", "build", "pdf.mjs")
+  );
+  copyMinifiedRuntimeFile(
+    path.join(pdfJsDir, "legacy", "build", "pdf.worker.min.mjs"),
+    path.join(pdfJsDir, "legacy", "build", "pdf.worker.mjs")
+  );
+}
+
+function copyMinifiedRuntimeFile(source, target) {
+  if (!fs.existsSync(source)) {
+    return;
+  }
+  const content = fs.readFileSync(source, "utf8").replace(/\n?\/\/# sourceMappingURL=.*$/m, "");
+  fs.writeFileSync(target, content, "utf8");
 }
 
 function pruneOfficeParserRuntimeFiles() {
@@ -186,6 +248,33 @@ function pruneOfficeParserRuntimeFiles() {
 
 function pruneUnusedReleaseFiles() {
   removeFilesBySuffixes(OUT_DIR, UNUSED_RELEASE_SUFFIXES);
+}
+
+function pruneUnusedReleaseDocs() {
+  removeFilesByNamePrefixes(OUT_DIR, UNUSED_RELEASE_DOC_NAMES);
+}
+
+function pruneUnusedReleaseTests() {
+  removeDirectoriesByNames(path.join(OUT_DIR, "node_modules"), UNUSED_RELEASE_TEST_DIRS);
+  removeTestScriptFiles(path.join(OUT_DIR, "node_modules"));
+}
+
+function minifyRuntimeScripts() {
+  walkFiles(path.join(OUT_DIR, "node_modules"), (filePath) => {
+    if (!MINIFY_SCRIPT_EXTENSIONS.includes(path.extname(filePath))) {
+      return;
+    }
+
+    const source = fs.readFileSync(filePath, "utf8");
+    const result = esbuild.transformSync(source, {
+      loader: "js",
+      legalComments: "none",
+      minify: true,
+      sourcemap: false,
+      target: "esnext"
+    });
+    fs.writeFileSync(filePath, result.code, "utf8");
+  });
 }
 
 function removeFilesBySuffixes(dir, suffixes) {
@@ -201,6 +290,73 @@ function removeFilesBySuffixes(dir, suffixes) {
     }
     if (entry.isFile() && suffixes.some((suffix) => entry.name.endsWith(suffix))) {
       fs.rmSync(entryPath, { force: true });
+    }
+  });
+}
+
+function removeFilesByNamePrefixes(dir, prefixes) {
+  if (!fs.existsSync(dir)) {
+    return;
+  }
+
+  fs.readdirSync(dir, { withFileTypes: true }).forEach((entry) => {
+    const entryPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      removeFilesByNamePrefixes(entryPath, prefixes);
+      return;
+    }
+    const lowerName = entry.name.toLowerCase();
+    if (entry.isFile() && prefixes.some((prefix) => lowerName === prefix || lowerName.startsWith(prefix + "."))) {
+      fs.rmSync(entryPath, { force: true });
+    }
+  });
+}
+
+function removeDirectoriesByNames(dir, names) {
+  if (!fs.existsSync(dir)) {
+    return;
+  }
+
+  fs.readdirSync(dir, { withFileTypes: true }).forEach((entry) => {
+    const entryPath = path.join(dir, entry.name);
+    if (!entry.isDirectory()) {
+      return;
+    }
+    if (names.includes(entry.name.toLowerCase())) {
+      fs.rmSync(entryPath, { recursive: true, force: true });
+      return;
+    }
+    removeDirectoriesByNames(entryPath, names);
+  });
+}
+
+function removeTestScriptFiles(dir) {
+  walkFiles(dir, (filePath) => {
+    const lowerName = path.basename(filePath).toLowerCase();
+    if (
+      lowerName === "test.js" ||
+      lowerName === "tests.js" ||
+      lowerName.endsWith(".test.js") ||
+      lowerName.endsWith(".spec.js")
+    ) {
+      fs.rmSync(filePath, { force: true });
+    }
+  });
+}
+
+function walkFiles(dir, visit) {
+  if (!fs.existsSync(dir)) {
+    return;
+  }
+
+  fs.readdirSync(dir, { withFileTypes: true }).forEach((entry) => {
+    const entryPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      walkFiles(entryPath, visit);
+      return;
+    }
+    if (entry.isFile()) {
+      visit(entryPath);
     }
   });
 }

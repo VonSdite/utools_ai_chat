@@ -14,5 +14,8 @@
     "markdown-it": "^14.1.1",
     "officeparser": "^7.0.3",
     "word-extractor": "^1.0.4"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.0"
   }
 }
