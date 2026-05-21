@@ -4,6 +4,11 @@ AI Chat 是一个运行在 uTools 里的 AI 助手，支持对话、翻译、总
 
 开源地址: https://github.com/VonSdite/utools_ai_chat
 
+- 使用 OpenAI 兼容的 `/v1/chat/completions` 接口，接入模型服务；
+- 支持对接多模态模型，进行OCR、翻译、总结、解释、AI对话；
+- AI对话支持slash命令，支持搜索历史会话，支持创建不同的助手系统提示词，支持文档处理；
+- 支持选中文本朗读；
+
 ## 命令入口
 
 - `AI Chat`：进入对话。
