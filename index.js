@@ -86,7 +86,9 @@
     renderSettings();
     renderChat();
     renderTaskModelSelect();
-    renderTaskModeButtons();
+    renderSideTabs();
+    updateTaskInputPlaceholder();
+    updateTaskFileAccept();
     renderActiveTaskState();
     updateViewTitle();
     renderChatSidebarState();
@@ -112,7 +114,6 @@
     els.taskFileInput = document.getElementById("taskFileInput");
     els.taskAttachBtn = document.getElementById("taskAttachBtn");
     els.taskModelSelect = document.getElementById("taskModelSelect");
-    els.taskModeBtns = Array.from(document.querySelectorAll("[data-task-mode]"));
     els.sendTaskBtn = document.getElementById("sendTaskBtn");
     els.stopTaskBtn = document.getElementById("stopTaskBtn");
     els.clearTaskBtn = document.getElementById("clearTaskBtn");
@@ -194,11 +195,6 @@
     els.taskAttachments.addEventListener("click", handleAttachmentClick);
     els.taskModelSelect.addEventListener("change", function (event) {
       updateModeModel(state.activeTaskMode, event.target.value);
-    });
-    els.taskModeBtns.forEach(function (button) {
-      button.addEventListener("click", function () {
-        setTaskMode(button.dataset.taskMode);
-      });
     });
     els.inputText.addEventListener("keydown", function (event) {
       handleSubmitKeydown(event, startTask);
@@ -611,13 +607,12 @@
     }
     state.activeTab = nextTab;
 
-    els.sideTabs.forEach(function (tab) {
-      tab.classList.toggle("is-active", tab.dataset.tab === state.activeTab);
-    });
+    renderSideTabs();
     els.taskView.classList.toggle("is-active", state.activeTab === "task");
     els.chatView.classList.toggle("is-active", state.activeTab === "chat");
     els.settingsView.classList.toggle("is-active", state.activeTab === "settings");
-    renderTaskModeButtons();
+    updateTaskInputPlaceholder();
+    updateTaskFileAccept();
     updateViewTitle();
     renderTaskModelSelect();
     renderChatModelSelect();
@@ -645,31 +640,14 @@
     els.chatSidebarToggleBtn.setAttribute("aria-expanded", collapsed ? "false" : "true");
   }
 
-  function setTaskMode(mode) {
-    if (!TASKS[mode]) {
-      return;
-    }
-    if (mode !== state.activeTaskMode) {
-      syncActiveTaskFromInput({ immediate: true });
-    }
-    state.activeTaskMode = mode;
-    if (state.activeTab !== "task") {
-      state.activeTab = "task";
-    }
-    renderTaskModeButtons();
-    updateViewTitle();
-    renderTaskModelSelect();
-    updateTaskFileAccept();
-    renderActiveTaskState();
-  }
-
-  function renderTaskModeButtons() {
-    els.taskModeBtns.forEach(function (button) {
-      var active = button.dataset.taskMode === state.activeTaskMode;
-      button.classList.toggle("is-active", active);
-      button.setAttribute("aria-pressed", active ? "true" : "false");
+  function renderSideTabs() {
+    els.sideTabs.forEach(function (tab) {
+      var tabName = tab.dataset.tab;
+      var active = TASKS[tabName]
+        ? state.activeTab === "task" && tabName === state.activeTaskMode
+        : tabName === state.activeTab;
+      tab.classList.toggle("is-active", active);
     });
-    updateTaskInputPlaceholder();
   }
 
   function updateTaskInputPlaceholder() {

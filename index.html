@@ -18,9 +18,21 @@
             <span class="lucide-mask nav-lucide icon-message-circle" aria-hidden="true"></span>
             <span class="sr-only">对话</span>
           </button>
-          <button class="side-tab" type="button" data-tab="task" title="翻译、总结、解释、OCR" aria-label="翻译、总结、解释、OCR">
-            <span class="nav-icon nav-icon-task" aria-hidden="true"></span>
-            <span class="sr-only">翻译、总结、解释、OCR</span>
+          <button class="side-tab" type="button" data-tab="translate" title="翻译" aria-label="翻译">
+            <span class="lucide-mask nav-lucide icon-languages" aria-hidden="true"></span>
+            <span class="sr-only">翻译</span>
+          </button>
+          <button class="side-tab" type="button" data-tab="summary" title="总结" aria-label="总结">
+            <span class="lucide-mask nav-lucide icon-clipboard-list" aria-hidden="true"></span>
+            <span class="sr-only">总结</span>
+          </button>
+          <button class="side-tab" type="button" data-tab="explain" title="解释" aria-label="解释">
+            <span class="lucide-mask nav-lucide icon-book-open" aria-hidden="true"></span>
+            <span class="sr-only">解释</span>
+          </button>
+          <button class="side-tab" type="button" data-tab="ocr" title="OCR" aria-label="OCR">
+            <span class="lucide-mask nav-lucide icon-scan-text" aria-hidden="true"></span>
+            <span class="sr-only">OCR</span>
           </button>
         </nav>
         <button class="side-tab settings-tab" type="button" data-tab="settings" title="设置" aria-label="设置">
@@ -47,13 +59,7 @@
         <main class="main">
           <section class="view" id="taskView">
             <section class="input-panel">
-              <div class="mode-model-row task-mode-row">
-                <div class="task-mode-switch" role="group" aria-label="处理模式">
-                  <button class="task-mode-btn is-active" type="button" data-task-mode="translate">翻译</button>
-                  <button class="task-mode-btn" type="button" data-task-mode="summary">总结</button>
-                  <button class="task-mode-btn" type="button" data-task-mode="explain">解释</button>
-                  <button class="task-mode-btn" type="button" data-task-mode="ocr">OCR</button>
-                </div>
+              <div class="mode-model-row">
                 <select id="taskModelSelect" class="mode-model-select" aria-label="当前模型"></select>
               </div>
               <textarea id="inputText" spellcheck="false" placeholder="把小纸条放这里，我来认真读"></textarea>

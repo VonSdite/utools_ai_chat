@@ -66,7 +66,7 @@ if (typeof utools !== "undefined" && utools.onPluginEnter) {
 }
 
 if (typeof utools !== "undefined" && utools.setExpendHeight) {
-  utools.setExpendHeight(720);
+  utools.setExpendHeight(680);
 }
 
 window.markMind = {

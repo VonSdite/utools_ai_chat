@@ -4,7 +4,7 @@
   "preload": "preload.js",
   "pluginSetting": {
     "single": true,
-    "height": 720
+    "height": 680
   },
   "features": [
     {

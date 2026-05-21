@@ -140,18 +140,6 @@ button:disabled {
   height: 20px;
 }
 
-.nav-icon-task {
-  display: grid;
-  place-items: center;
-}
-
-.nav-icon-task::before {
-  content: "✦";
-  font-size: 20px;
-  line-height: 1;
-  transform: translateY(-1px);
-}
-
 .nav-icon-settings {
   display: grid;
   place-items: center;
@@ -816,7 +804,7 @@ button:disabled {
 
 #chatView {
   position: relative;
-  grid-template-columns: 260px minmax(0, 1fr);
+  grid-template-columns: 228px minmax(0, 1fr);
   gap: 12px;
   height: calc(100vh - 66px);
   min-height: 0;
@@ -1411,44 +1399,6 @@ button:disabled {
   margin-bottom: 8px;
 }
 
-.task-mode-row {
-  justify-content: space-between;
-}
-
-.task-mode-switch {
-  display: inline-flex;
-  min-height: 34px;
-  overflow: hidden;
-  flex: 0 0 auto;
-  border: 1px solid var(--line);
-  border-radius: 7px;
-  background: #ffffff;
-}
-
-.task-mode-btn {
-  min-width: 58px;
-  padding: 0 12px;
-  border-right: 1px solid var(--line);
-  background: transparent;
-  color: var(--muted);
-  font-size: 13px;
-  font-weight: 680;
-}
-
-.task-mode-btn:last-child {
-  border-right: 0;
-}
-
-.task-mode-btn:hover {
-  background: #f7faf8;
-  color: var(--ink);
-}
-
-.task-mode-btn.is-active {
-  background: #e6f4f1;
-  color: var(--teal-dark);
-}
-
 .mode-model-select {
   width: min(360px, 100%);
   min-height: 34px;
@@ -1554,6 +1504,26 @@ button:disabled {
 .icon-message-circle {
   -webkit-mask-image: url("vendor/icons/message-circle.svg");
   mask-image: url("vendor/icons/message-circle.svg");
+}
+
+.icon-languages {
+  -webkit-mask-image: url("vendor/icons/languages.svg");
+  mask-image: url("vendor/icons/languages.svg");
+}
+
+.icon-clipboard-list {
+  -webkit-mask-image: url("vendor/icons/clipboard-list.svg");
+  mask-image: url("vendor/icons/clipboard-list.svg");
+}
+
+.icon-book-open {
+  -webkit-mask-image: url("vendor/icons/book-open.svg");
+  mask-image: url("vendor/icons/book-open.svg");
+}
+
+.icon-scan-text {
+  -webkit-mask-image: url("vendor/icons/scan-text.svg");
+  mask-image: url("vendor/icons/scan-text.svg");
 }
 
 .full-field {
@@ -2324,20 +2294,6 @@ button:disabled {
   #taskView {
     height: calc(100vh - 111px);
     grid-template-rows: minmax(230px, auto) minmax(220px, 1fr);
-  }
-
-  .task-mode-row {
-    align-items: stretch;
-    flex-direction: column;
-  }
-
-  .task-mode-switch,
-  .task-mode-row .mode-model-select {
-    width: 100%;
-  }
-
-  .task-mode-btn {
-    flex: 1;
   }
 
   #chatView {
