@@ -2,58 +2,72 @@ const http = require("node:http");
 const https = require("node:https");
 const tls = require("node:tls");
 const net = require("node:net");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
 const { execFileSync } = require("node:child_process");
 const { URL } = require("node:url");
 
-const CONFIG_KEY = "markmind/config/v1";
-const LEGACY_CONFIG_KEY = "huayi/config/v1";
-const CHAT_STORE_KEY = "markmind/chats/v1";
+const CONFIG_KEY = "ai-agent/config/v1";
+const CHAT_STORE_KEY = "ai-agent/chats/v1";
+const DEFAULT_DATA_DIR = getDefaultDataDir();
+const CHAT_STORE_FILE = "chat-store.json";
+const CACHE_DIR = "cache";
 const REQUEST_TIMEOUT_MS = 120000;
 const MAX_ERROR_BODY = 2000;
 const MAX_DOCUMENT_CHARS = 60000;
-const MODEL_MODES = ["translate", "summary", "explain", "chat"];
+const DEFAULT_RECENT_CLIPBOARD_MS = 2000;
+const DEFAULT_CLIPBOARD_POLL_MS = 500;
+const MODEL_MODES = ["translate", "summary", "explain", "ocr", "chat"];
+const TEXT_EXTENSIONS = [
+  "txt", "md", "markdown", "csv", "tsv", "json", "jsonl", "yaml", "yml",
+  "xml", "html", "htm", "log", "ini", "conf", "js", "jsx", "ts", "tsx",
+  "css", "scss", "less", "py", "java", "go", "rs", "c", "cpp", "h", "hpp",
+  "cs", "php", "rb", "sh", "bat", "ps1", "sql"
+];
+const IMAGE_MIME_BY_EXTENSION = {
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  webp: "image/webp",
+  gif: "image/gif",
+  bmp: "image/bmp"
+};
 
 let electronSession = null;
 let electronClipboard = null;
-let electronIpcRenderer = null;
 
 try {
   const electron = require("electron");
   electronSession = electron.session || null;
   electronClipboard = electron.clipboard || null;
-  electronIpcRenderer = electron.ipcRenderer || null;
 } catch (error) {
   electronSession = null;
   electronClipboard = null;
-  electronIpcRenderer = null;
 }
 
 let activeRequest = null;
 let activeSocket = null;
+const activeChatRequests = new Map();
 let lastEnterAction = null;
-let standaloneWindow = null;
+let clipboardSnapshotText = "";
+let clipboardChangedAt = 0;
+let clipboardSnapshotImage = null;
+let clipboardImageFingerprint = "";
+let clipboardImageChangedAt = 0;
+let clipboardWatcherTimer = null;
+let clipboardWatcherIntervalMs = 0;
 const enterListeners = new Set();
 
 if (typeof utools !== "undefined" && utools.onPluginEnter) {
   utools.onPluginEnter((action) => {
     const normalized = normalizeEnterAction(action);
-    if (shouldUseStandaloneWindow()) {
-      openStandaloneWindow(normalized);
-      lastEnterAction = null;
-      return;
-    }
     dispatchEnterAction(normalized);
   });
 }
 
 if (typeof utools !== "undefined" && utools.setExpendHeight) {
   utools.setExpendHeight(720);
-}
-
-if (electronIpcRenderer) {
-  electronIpcRenderer.on("markmind-enter-action", (event, action) => {
-    dispatchEnterAction(normalizeEnterAction(action));
-  });
 }
 
 window.markMind = {
@@ -67,9 +81,17 @@ window.markMind = {
   translate(payload, onEvent) {
     return runTask(Object.assign({}, payload, { mode: "translate" }), onEvent);
   },
+  ocr(payload, onEvent) {
+    return runTask(Object.assign({}, payload, { mode: "ocr" }), onEvent);
+  },
   abortActive,
+  abortChat,
   copyText,
   getClipboardText,
+  getRecentClipboardText,
+  getRecentClipboardImage,
+  chooseDataDirectory,
+  chooseAttachmentFiles,
   onEnter(listener) {
     enterListeners.add(listener);
     return () => enterListeners.delete(listener);
@@ -80,11 +102,18 @@ window.markMind = {
 };
 window.quickEnglish = window.markMind;
 
+startClipboardWatcher(getConfig().clipboardPollingMs);
+
 function normalizeEnterAction(action) {
   const source = action && typeof action === "object" ? action : {};
   return {
     code: typeof source.code === "string" ? source.code : "",
     type: typeof source.type === "string" ? source.type : "",
+    keyword: typeof source.keyword === "string" ? source.keyword : "",
+    cmd: typeof source.cmd === "string" ? source.cmd : "",
+    name: typeof source.name === "string" ? source.name : "",
+    label: typeof source.label === "string" ? source.label : "",
+    option: source.option,
     payload: source.payload
   };
 }
@@ -100,86 +129,9 @@ function dispatchEnterAction(action) {
   });
 }
 
-function shouldUseStandaloneWindow() {
-  return (
-    typeof utools !== "undefined" &&
-    typeof utools.createBrowserWindow === "function" &&
-    typeof utools.getWindowType === "function" &&
-    utools.getWindowType() === "main"
-  );
-}
-
-function openStandaloneWindow(action) {
-  const existing = getUsableStandaloneWindow();
-  if (existing) {
-    showStandaloneWindow(existing, action);
-    return;
-  }
-
-  standaloneWindow = utools.createBrowserWindow(
-    "index.html",
-    {
-      show: false,
-      title: "MarkMind",
-      width: 1120,
-      height: 760,
-      minWidth: 900,
-      minHeight: 620,
-      center: true,
-      closeable: true,
-      autoHideMenuBar: true,
-      backgroundColor: "#f4f6f5",
-      webPreferences: {
-        preload: "preload.js"
-      }
-    },
-    () => {
-      setTimeout(() => {
-        showStandaloneWindow(standaloneWindow, action);
-      }, 0);
-    }
-  );
-}
-
-function getUsableStandaloneWindow() {
-  if (!standaloneWindow) {
-    return null;
-  }
-  try {
-    if (typeof standaloneWindow.isDestroyed === "function" && standaloneWindow.isDestroyed()) {
-      standaloneWindow = null;
-      return null;
-    }
-    return standaloneWindow;
-  } catch (error) {
-    standaloneWindow = null;
-    return null;
-  }
-}
-
-function showStandaloneWindow(targetWindow, action) {
-  try {
-    if (targetWindow && typeof targetWindow.show === "function") {
-      targetWindow.show();
-    }
-    if (targetWindow && typeof targetWindow.focus === "function") {
-      targetWindow.focus();
-    }
-    if (targetWindow && targetWindow.webContents) {
-      targetWindow.webContents.send("markmind-enter-action", action);
-    }
-    if (typeof utools !== "undefined" && typeof utools.hideMainWindow === "function") {
-      utools.hideMainWindow(false);
-    }
-  } catch (error) {
-    standaloneWindow = null;
-    throw error;
-  }
-}
-
 function getConfig() {
   const storage = getStorage();
-  const stored = storage ? storage.getItem(CONFIG_KEY) || storage.getItem(LEGACY_CONFIG_KEY) : null;
+  const stored = storage ? storage.getItem(CONFIG_KEY) : null;
   return normalizeConfig(stored);
 }
 
@@ -190,22 +142,25 @@ function saveConfig(config) {
     throw new Error("当前环境不可用，无法保存设置");
   }
   storage.setItem(CONFIG_KEY, normalized);
+  startClipboardWatcher(normalized.clipboardPollingMs);
   return normalized;
 }
 
 function getChatStore() {
-  const storage = getStorage();
-  const stored = storage ? storage.getItem(CHAT_STORE_KEY) : null;
-  return normalizeChatStore(stored);
+  const config = getConfig();
+  const stored = readChatStoreFile(config);
+  if (stored) {
+    return normalizeChatStore(stored);
+  }
+
+  const normalized = normalizeChatStore(null);
+  writeChatStoreFile(config, normalized);
+  return normalized;
 }
 
 function saveChatStore(store) {
   const normalized = normalizeChatStore(store);
-  const storage = getStorage();
-  if (!storage) {
-    throw new Error("当前环境不可用，无法保存会话");
-  }
-  storage.setItem(CHAT_STORE_KEY, normalized);
+  writeChatStoreFile(getConfig(), normalized);
   return normalized;
 }
 
@@ -217,16 +172,21 @@ async function runTask(payload, onEvent) {
   if (!text && !attachments.length) {
     throw new Error("输入为空");
   }
+  if (mode === "ocr" && !hasImageAttachments(attachments)) {
+    throw new Error("OCR 需要先添加图片");
+  }
 
   const config = getConfig();
   const provider = resolveProvider(config, payload && payload.providerId, payload && payload.modelId, mode);
+  if (!provider && mode === "ocr") {
+    throw new Error("OCR 需要先配置一个多模态模型");
+  }
   validateProvider(provider);
   const messages = buildTaskMessages(mode, text, attachments, provider);
   return completeWithMessages(provider, messages, onEvent);
 }
 
 async function sendChat(payload, onEvent) {
-  abortActive();
   const config = getConfig();
   const provider = resolveProvider(config, payload && payload.providerId, payload && payload.modelId, "chat");
   validateProvider(provider);
@@ -234,7 +194,11 @@ async function sendChat(payload, onEvent) {
   if (!messages.length) {
     throw new Error("消息为空");
   }
-  return completeWithMessages(provider, messages, onEvent);
+  const requestId =
+    payload && typeof payload.requestId === "string" && payload.requestId
+      ? payload.requestId
+      : "";
+  return completeWithMessages(provider, messages, onEvent, { requestId });
 }
 
 async function fetchModels(payload) {
@@ -263,39 +227,44 @@ async function fetchModels(payload) {
   throw new Error(`拉取模型失败，已尝试 /v1/models 和 /models。${errors.join("；")}`);
 }
 
-async function completeWithMessages(provider, messages, onEvent) {
+async function completeWithMessages(provider, messages, onEvent, requestOptions) {
+  const options = requestOptions || {};
   const endpoint = new URL(provider.endpoint);
-  const body = JSON.stringify({
-    model: provider.model,
-    stream: true,
-    temperature: 0.2,
-    messages
-  });
-
-  const headers = {
-    Accept: "text/event-stream",
-    "Content-Type": "application/json",
-    "Content-Length": Buffer.byteLength(body),
-    "User-Agent": "MarkMind-uTools/0.1.0"
-  };
+  let body = createCompletionRequestBody(provider, messages, true);
+  let headers = createCompletionHeaders(body);
 
   if (provider.apiKey) {
     headers.Authorization = `Bearer ${provider.apiKey}`;
   }
 
   try {
-    emit(onEvent, { type: "status", message: "准备中" });
     const proxy = await resolveProxy(provider, endpoint.href);
     emit(onEvent, {
       type: "status",
       message: "生成中"
     });
 
-    const content = proxy
-      ? await requestViaProxy(endpoint, provider, body, headers, proxy, onEvent)
-      : await requestDirect(endpoint, provider, body, headers, onEvent);
+    let result;
+    try {
+      result = proxy
+        ? await requestViaProxy(endpoint, provider, body, headers, proxy, onEvent, options)
+        : await requestDirect(endpoint, provider, body, headers, onEvent, options);
+    } catch (error) {
+      if (!shouldRetryWithoutStreamUsage(error)) {
+        throw error;
+      }
+      body = createCompletionRequestBody(provider, messages, false);
+      headers = createCompletionHeaders(body);
+      if (provider.apiKey) {
+        headers.Authorization = `Bearer ${provider.apiKey}`;
+      }
+      result = proxy
+        ? await requestViaProxy(endpoint, provider, body, headers, proxy, onEvent, options)
+        : await requestDirect(endpoint, provider, body, headers, onEvent, options);
+    }
 
-    emit(onEvent, { type: "done", text: content });
+    const content = typeof result === "string" ? result : result.content || "";
+    emit(onEvent, { type: "done", text: content, usage: result.usage || null });
     return {
       content,
       providerName: provider.name,
@@ -305,9 +274,43 @@ async function completeWithMessages(provider, messages, onEvent) {
     emit(onEvent, { type: "error", message: error.message || String(error) });
     throw error;
   } finally {
-    activeRequest = null;
-    activeSocket = null;
+    if (options.requestId) {
+      activeChatRequests.delete(options.requestId);
+    } else {
+      activeRequest = null;
+      activeSocket = null;
+    }
   }
+}
+
+function createCompletionRequestBody(provider, messages, includeUsage) {
+  const payload = {
+    model: provider.model,
+    stream: true,
+    temperature: 0.2,
+    messages
+  };
+  if (includeUsage) {
+    payload.stream_options = { include_usage: true };
+  }
+  return JSON.stringify(payload);
+}
+
+function createCompletionHeaders(body) {
+  return {
+    Accept: "text/event-stream",
+    "Content-Type": "application/json",
+    "Content-Length": Buffer.byteLength(body),
+    "User-Agent": "AI-Agent-uTools/0.1.0"
+  };
+}
+
+function shouldRetryWithoutStreamUsage(error) {
+  const message = String((error && error.message) || error || "");
+  return (
+    /HTTP\s+(400|404|422)/i.test(message) &&
+    /(stream_options|include_usage|unknown parameter|unrecognized|unsupported|extra field)/i.test(message)
+  );
 }
 
 function abortActive() {
@@ -324,10 +327,26 @@ function abortActive() {
   }
 }
 
+function abortChat(requestId) {
+  const entry = activeChatRequests.get(String(requestId || ""));
+  if (!entry) {
+    return;
+  }
+  activeChatRequests.delete(String(requestId || ""));
+  if (entry.request && !entry.request.destroyed) {
+    entry.request.destroy(new Error("请求已取消"));
+  }
+  if (entry.socket && !entry.socket.destroyed) {
+    entry.socket.destroy(new Error("请求已取消"));
+  }
+}
+
 function copyText(text) {
   const value = String(text || "");
   if (electronClipboard) {
     electronClipboard.writeText(value);
+    rememberClipboardText(value);
+    rememberClipboardImage(null, "");
     return true;
   }
   if (navigator.clipboard) {
@@ -346,6 +365,197 @@ function getClipboardText() {
   return "";
 }
 
+function getRecentClipboardText(maxAgeMs) {
+  updateClipboardSnapshot();
+  const ageLimit = Number(maxAgeMs) || 0;
+  if (!clipboardChangedAt || !ageLimit || Date.now() - clipboardChangedAt > ageLimit) {
+    return "";
+  }
+  return clipboardSnapshotText;
+}
+
+function getRecentClipboardImage(maxAgeMs) {
+  updateClipboardSnapshot();
+  const ageLimit = Number(maxAgeMs) || 0;
+  if (!clipboardImageChangedAt || !ageLimit || Date.now() - clipboardImageChangedAt > ageLimit) {
+    return null;
+  }
+  return clipboardSnapshotImage ? Object.assign({}, clipboardSnapshotImage) : null;
+}
+
+function startClipboardWatcher(intervalMs) {
+  if (!electronClipboard) {
+    return;
+  }
+  const nextIntervalMs = normalizeClipboardPollingMs(intervalMs);
+  if (clipboardWatcherTimer && clipboardWatcherIntervalMs === nextIntervalMs) {
+    return;
+  }
+  if (clipboardWatcherTimer) {
+    clearInterval(clipboardWatcherTimer);
+    clipboardWatcherTimer = null;
+  }
+  clipboardWatcherIntervalMs = nextIntervalMs;
+  clipboardSnapshotText = safeReadClipboardText();
+  clipboardSnapshotImage = safeReadClipboardImage();
+  clipboardImageFingerprint = createClipboardImageFingerprint(clipboardSnapshotImage);
+  clipboardImageChangedAt = 0;
+  clipboardWatcherTimer = setInterval(updateClipboardSnapshot, nextIntervalMs);
+}
+
+function updateClipboardSnapshot() {
+  if (!electronClipboard) {
+    return;
+  }
+  const value = safeReadClipboardText();
+  if (value !== clipboardSnapshotText) {
+    rememberClipboardText(value);
+  }
+  const image = safeReadClipboardImage();
+  const imageFingerprint = createClipboardImageFingerprint(image);
+  if (imageFingerprint !== clipboardImageFingerprint) {
+    rememberClipboardImage(image, imageFingerprint);
+  }
+}
+
+function rememberClipboardText(value) {
+  clipboardSnapshotText = String(value || "");
+  clipboardChangedAt = Date.now();
+}
+
+function rememberClipboardImage(image, fingerprint) {
+  clipboardSnapshotImage = image || null;
+  clipboardImageFingerprint = fingerprint || "";
+  clipboardImageChangedAt = image ? Date.now() : 0;
+}
+
+function safeReadClipboardText() {
+  try {
+    return String(electronClipboard ? electronClipboard.readText() || "" : "");
+  } catch (error) {
+    return "";
+  }
+}
+
+function safeReadClipboardImage() {
+  try {
+    if (!electronClipboard || typeof electronClipboard.readImage !== "function") {
+      return null;
+    }
+    if (typeof electronClipboard.availableFormats === "function") {
+      const formats = electronClipboard.availableFormats();
+      if (!isSingleClipboardImageCandidate(formats)) {
+        return null;
+      }
+    }
+    const image = electronClipboard.readImage();
+    if (!image || (typeof image.isEmpty === "function" && image.isEmpty())) {
+      return null;
+    }
+    const dataUrl = image.toDataURL();
+    if (!dataUrl || !/^data:image\//i.test(dataUrl)) {
+      return null;
+    }
+    const size = typeof image.getSize === "function" ? image.getSize() : { width: 0, height: 0 };
+    return {
+      id: createStorageId("file"),
+      kind: "image",
+      name: "clipboard-image.png",
+      mime: getDataUrlMime(dataUrl) || "image/png",
+      size: estimateDataUrlBytes(dataUrl),
+      width: Number(size.width) || 0,
+      height: Number(size.height) || 0,
+      dataUrl
+    };
+  } catch (error) {
+    return null;
+  }
+}
+
+function isSingleClipboardImageCandidate(formats) {
+  const normalized = (Array.isArray(formats) ? formats : [])
+    .map((format) => String(format || "").toLowerCase());
+  const hasImageFormat = normalized.some((format) => /image|bitmap|png|jpeg|jpg|bmp/.test(format));
+  if (!hasImageFormat) {
+    return false;
+  }
+  const hasFileListFormat = normalized.some((format) =>
+    /file|filename|uri-list|x-moz-file|promise-url/.test(format)
+  );
+  if (hasFileListFormat) {
+    return false;
+  }
+  const htmlImageCount = countClipboardHtmlImages();
+  return htmlImageCount <= 1;
+}
+
+function countClipboardHtmlImages() {
+  try {
+    if (!electronClipboard || typeof electronClipboard.readHTML !== "function") {
+      return 0;
+    }
+    const html = String(electronClipboard.readHTML() || "");
+    return (html.match(/<img\b/gi) || []).length;
+  } catch (error) {
+    return 0;
+  }
+}
+
+function createClipboardImageFingerprint(image) {
+  if (!image || !image.dataUrl) {
+    return "";
+  }
+  const value = image.dataUrl;
+  return `${value.length}:${value.slice(0, 96)}:${value.slice(-96)}`;
+}
+
+function getDataUrlMime(dataUrl) {
+  const match = String(dataUrl || "").match(/^data:([^;,]+)[;,]/);
+  return match ? match[1] : "";
+}
+
+function estimateDataUrlBytes(dataUrl) {
+  const payload = String(dataUrl || "").split(",")[1] || "";
+  return Math.floor((payload.length * 3) / 4);
+}
+
+async function chooseDataDirectory(currentDir) {
+  if (typeof utools === "undefined" || typeof utools.showOpenDialog !== "function") {
+    return "";
+  }
+
+  const selected = await utools.showOpenDialog({
+    title: "选择数据目录",
+    defaultPath: getDialogDefaultPath(currentDir),
+    properties: ["openDirectory", "createDirectory", "promptToCreate"]
+  });
+
+  return Array.isArray(selected) && selected[0] ? normalizeDataDir(selected[0]) : "";
+}
+
+async function chooseAttachmentFiles(options) {
+  if (typeof utools === "undefined" || typeof utools.showOpenDialog !== "function") {
+    return { attachments: [], errors: [] };
+  }
+  const imagesOnly = options && options.imagesOnly === true;
+
+  const selected = await utools.showOpenDialog({
+    title: imagesOnly ? "选择图片" : "选择附件",
+    properties: ["openFile", "multiSelections"],
+    filters: [
+      imagesOnly
+        ? { name: "图片", extensions: Object.keys(IMAGE_MIME_BY_EXTENSION) }
+        : {
+            name: "支持的附件",
+            extensions: TEXT_EXTENSIONS.concat(Object.keys(IMAGE_MIME_BY_EXTENSION))
+          },
+      imagesOnly ? { name: "所有图片", extensions: Object.keys(IMAGE_MIME_BY_EXTENSION) } : { name: "所有文件", extensions: ["*"] }
+    ]
+  });
+
+  return readLocalAttachmentFiles(Array.isArray(selected) ? selected : [], { imagesOnly });
+}
+
 function getStorage() {
   if (typeof utools !== "undefined") {
     if (utools.dbCryptoStorage) {
@@ -358,14 +568,148 @@ function getStorage() {
   return null;
 }
 
+function getDefaultDataDir() {
+  if (process.platform === "win32") {
+    return "D:\\utools_ai_agent";
+  }
+  return path.join(os.homedir() || process.cwd(), "utools_ai_agent");
+}
+
+function getDialogDefaultPath(currentDir) {
+  const dataDir = normalizeDataDir(currentDir);
+  if (isDirectory(dataDir)) {
+    return dataDir;
+  }
+
+  const parent = path.dirname(dataDir);
+  if (parent && parent !== dataDir && isDirectory(parent)) {
+    return parent;
+  }
+
+  const homeDir = os.homedir();
+  if (homeDir && isDirectory(homeDir)) {
+    return homeDir;
+  }
+
+  return process.cwd();
+}
+
+function isDirectory(targetPath) {
+  try {
+    return fs.statSync(targetPath).isDirectory();
+  } catch (error) {
+    return false;
+  }
+}
+
+function readLocalAttachmentFiles(filePaths, options) {
+  const attachments = [];
+  const errors = [];
+  const imagesOnly = options && options.imagesOnly === true;
+
+  filePaths.forEach((filePath) => {
+    try {
+      const attachment = readLocalAttachmentFile(filePath);
+      if (imagesOnly && attachment && attachment.kind !== "image") {
+        throw new Error("OCR 只能选择图片");
+      }
+      if (attachment) {
+        attachments.push(attachment);
+      }
+    } catch (error) {
+      errors.push(`${path.basename(filePath)}：${error.message || String(error)}`);
+    }
+  });
+
+  return { attachments, errors };
+}
+
+function readLocalAttachmentFile(filePath) {
+  const stat = fs.statSync(filePath);
+  if (!stat.isFile()) {
+    return null;
+  }
+
+  const name = path.basename(filePath);
+  const extension = path.extname(name).replace(/^\./, "").toLowerCase();
+  const imageMime = IMAGE_MIME_BY_EXTENSION[extension];
+  if (imageMime) {
+    return {
+      id: createStorageId("file"),
+      kind: "image",
+      name,
+      mime: imageMime,
+      size: stat.size,
+      dataUrl: `data:${imageMime};base64,${fs.readFileSync(filePath).toString("base64")}`
+    };
+  }
+
+  if (!isTextLikePath(extension)) {
+    throw new Error("暂时只能读取文本类文档");
+  }
+
+  let text = fs.readFileSync(filePath, "utf8");
+  if (text.length > MAX_DOCUMENT_CHARS) {
+    text = text.slice(0, MAX_DOCUMENT_CHARS);
+  }
+  return {
+    id: createStorageId("file"),
+    kind: "document",
+    name,
+    mime: "text/plain",
+    size: stat.size,
+    text
+  };
+}
+
+function isTextLikePath(extension) {
+  return TEXT_EXTENSIONS.includes(extension);
+}
+
+function readChatStoreFile(config) {
+  const filePath = getChatStorePath(config);
+  return readJsonFile(filePath);
+}
+
+function readJsonFile(filePath) {
+  if (!fs.existsSync(filePath)) {
+    return null;
+  }
+  const content = fs.readFileSync(filePath, "utf8");
+  if (!content.trim()) {
+    return null;
+  }
+  return JSON.parse(content);
+}
+
+function writeChatStoreFile(config, store) {
+  const dataDir = normalizeDataDir(config && config.dataDir);
+  ensureDataDirectory(dataDir);
+  fs.writeFileSync(
+    path.join(dataDir, CHAT_STORE_FILE),
+    JSON.stringify(store, null, 2),
+    "utf8"
+  );
+}
+
+function getChatStorePath(config) {
+  return path.join(normalizeDataDir(config && config.dataDir), CHAT_STORE_FILE);
+}
+
+function ensureDataDirectory(dataDir) {
+  fs.mkdirSync(dataDir, { recursive: true });
+  fs.mkdirSync(path.join(dataDir, CACHE_DIR), { recursive: true });
+}
+
 function normalizeMode(mode) {
-  if (mode === "summary" || mode === "explain") {
+  if (mode === "summary" || mode === "explain" || mode === "ocr") {
     return mode;
   }
   return "translate";
 }
 
 function buildTaskMessages(mode, text, attachments, provider) {
+  const fallbackText = mode === "ocr" ? "请识别图片中的文字。" : "请处理下面的内容。";
   return [
     {
       role: "system",
@@ -373,14 +717,14 @@ function buildTaskMessages(mode, text, attachments, provider) {
     },
     {
       role: "user",
-      content: buildUserContent(text, attachments, provider, "请处理下面的内容。")
+      content: buildUserContent(text, attachments, provider, fallbackText)
     }
   ];
 }
 
 function buildChatMessages(messages, provider, assistant) {
   const source = Array.isArray(messages) ? messages : [];
-  const normalized = source
+  const normalized = filterAfterContextClearMessages(source)
     .map((message) => normalizeConversationMessage(message, provider))
     .filter(Boolean);
 
@@ -393,7 +737,7 @@ function buildChatMessages(messages, provider, assistant) {
   const assistantName =
     assistant && typeof assistant.name === "string" ? assistant.name.trim() : "";
   const basePrompt =
-    "你是 MarkMind，一个清晰、可靠、简洁的 AI 助手。根据用户提供的文本、图片和文档上下文回答。遇到不确定内容时说明不确定，不要编造。";
+    "你是 AI Agent，一个清晰、可靠、简洁的 AI 助手。根据用户提供的文本、图片和文档上下文回答。遇到不确定内容时说明不确定，不要编造。";
 
   return [
     {
@@ -408,6 +752,9 @@ function buildChatMessages(messages, provider, assistant) {
 
 function normalizeConversationMessage(message, provider) {
   if (!message || typeof message !== "object") {
+    return null;
+  }
+  if (message.type === "clear") {
     return null;
   }
   const role = message.role === "assistant" ? "assistant" : "user";
@@ -428,6 +775,16 @@ function normalizeConversationMessage(message, provider) {
   };
 }
 
+function filterAfterContextClearMessages(messages) {
+  let lastClearIndex = -1;
+  messages.forEach((message, index) => {
+    if (message && message.type === "clear") {
+      lastClearIndex = index;
+    }
+  });
+  return messages.slice(lastClearIndex + 1);
+}
+
 function taskSystemPrompt(mode) {
   if (mode === "summary") {
     return (
@@ -446,6 +803,16 @@ function taskSystemPrompt(mode) {
       "\n1. 说明它是什么、为什么重要、相关背景和容易误解的地方。" +
       "\n2. 遇到英文术语时给出自然中文解释。" +
       "\n3. 可以给短例子，但不要离题。"
+    );
+  }
+
+  if (mode === "ocr") {
+    return (
+      "你是一个细致的 OCR 文字识别助手。请识别用户提供图片中的文字，并用中文 Markdown 输出。" +
+      "\n要求：" +
+      "\n1. 尽量保留原有阅读顺序、段落、换行、列表和表格结构。" +
+      "\n2. 只输出识别到的内容；看不清的地方用 [无法识别] 标注，不要猜测。" +
+      "\n3. 如果图片里没有可识别文字，请简短说明未识别到文字。"
     );
   }
 
@@ -529,36 +896,43 @@ function normalizeAttachments(attachments) {
     .filter(Boolean);
 }
 
+function hasImageAttachments(attachments) {
+  return (attachments || []).some((attachment) => attachment.kind === "image" && attachment.dataUrl);
+}
+
 function resolveProvider(config, providerId, modelId, mode) {
   const providers = Array.isArray(config.providers) ? config.providers : [];
-  const requested = resolveProviderModel(providers, providerId, modelId);
+  const requested = resolveProviderModel(providers, providerId, modelId, mode);
   if (requested) {
     return requested;
   }
   const modeSelection = config.modeModels && config.modeModels[mode] ? config.modeModels[mode] : null;
   const modeProvider = modeSelection
-    ? resolveProviderModel(providers, modeSelection.providerId, modeSelection.modelId)
+    ? resolveProviderModel(providers, modeSelection.providerId, modeSelection.modelId, mode)
     : null;
   if (modeProvider) {
     return modeProvider;
   }
-  const fallback = resolveProviderModel(providers, config.defaultProviderId, config.defaultModelId);
+  const fallback = resolveProviderModel(providers, config.defaultProviderId, config.defaultModelId, mode);
   if (fallback) {
     return fallback;
   }
-  const first = getFirstProviderModel(providers);
+  const first = getFirstProviderModel(providers, mode);
   return first ? first : null;
 }
 
-function resolveProviderModel(providers, providerId, modelId) {
+function resolveProviderModel(providers, providerId, modelId, mode) {
   const provider = providers.find((item) => item.id === providerId);
   if (!provider) {
     return null;
   }
   const model = modelId
     ? (provider.models || []).find((item) => item.id === modelId)
-    : (provider.models || [])[0];
+    : (provider.models || []).find((item) => modelAllowedForMode(item, mode));
   if (!model) {
+    return null;
+  }
+  if (!modelAllowedForMode(model, mode)) {
     return null;
   }
   return Object.assign({}, provider, {
@@ -568,18 +942,27 @@ function resolveProviderModel(providers, providerId, modelId) {
   });
 }
 
-function getFirstProviderModel(providers) {
+function getFirstProviderModel(providers, mode) {
   for (const provider of providers) {
-    if (provider.models && provider.models.length) {
-      const model = provider.models[0];
-      return Object.assign({}, provider, {
-        modelId: model.id,
-        model: model.model,
-        multimodal: model.multimodal === true
-      });
+    for (const model of provider.models || []) {
+      if (modelAllowedForMode(model, mode)) {
+        return Object.assign({}, provider, {
+          modelId: model.id,
+          model: model.model,
+          multimodal: model.multimodal === true
+        });
+      }
     }
   }
   return null;
+}
+
+function modeRequiresMultimodal(mode) {
+  return mode === "ocr";
+}
+
+function modelAllowedForMode(model, mode) {
+  return !modeRequiresMultimodal(mode) || (model && model.multimodal === true);
 }
 
 function validateProvider(provider) {
@@ -675,7 +1058,7 @@ async function fetchModelsFromEndpoint(endpoint, provider) {
 async function requestModelText(endpoint, provider) {
   const headers = {
     Accept: "application/json",
-    "User-Agent": "MarkMind-uTools/0.1.0"
+    "User-Agent": "AI-Agent-uTools/0.1.0"
   };
 
   if (provider.apiKey) {
@@ -941,7 +1324,7 @@ function resolveMacProxy(endpoint) {
   return null;
 }
 
-function requestDirect(endpoint, provider, body, headers, onEvent) {
+function requestDirect(endpoint, provider, body, headers, onEvent, requestOptions) {
   const transport = endpoint.protocol === "https:" ? https : http;
   const options = {
     protocol: endpoint.protocol,
@@ -954,12 +1337,12 @@ function requestDirect(endpoint, provider, body, headers, onEvent) {
     rejectUnauthorized: provider.sslVerify === true,
     timeout: REQUEST_TIMEOUT_MS
   };
-  return requestWithOptions(transport, options, body, onEvent);
+  return requestWithOptions(transport, options, body, onEvent, requestOptions);
 }
 
-async function requestViaProxy(endpoint, provider, body, headers, proxy, onEvent) {
+async function requestViaProxy(endpoint, provider, body, headers, proxy, onEvent, requestOptions) {
   if (endpoint.protocol === "https:") {
-    const tunnel = await createProxyTunnel(endpoint, provider, proxy);
+    const tunnel = await createProxyTunnel(endpoint, provider, proxy, requestOptions);
     const options = {
       protocol: endpoint.protocol,
       hostname: endpoint.hostname,
@@ -972,7 +1355,7 @@ async function requestViaProxy(endpoint, provider, body, headers, proxy, onEvent
       rejectUnauthorized: provider.sslVerify === true,
       timeout: REQUEST_TIMEOUT_MS
     };
-    return requestWithOptions(https, options, body, onEvent);
+    return requestWithOptions(https, options, body, onEvent, requestOptions);
   }
 
   const transport = proxy.protocol === "https:" ? https : http;
@@ -996,7 +1379,7 @@ async function requestViaProxy(endpoint, provider, body, headers, proxy, onEvent
     timeout: REQUEST_TIMEOUT_MS
   };
 
-  return requestWithOptions(transport, options, body, onEvent);
+  return requestWithOptions(transport, options, body, onEvent, requestOptions);
 }
 
 function requestModelDirect(endpoint, provider, headers) {
@@ -1057,7 +1440,7 @@ async function requestModelViaProxy(endpoint, provider, headers, proxy) {
   return requestTextWithOptions(transport, options);
 }
 
-function createProxyTunnel(endpoint, provider, proxy) {
+function createProxyTunnel(endpoint, provider, proxy, requestOptions) {
   return new Promise((resolve, reject) => {
     const transport = proxy.protocol === "https:" ? https : http;
     const endpointPort = endpoint.port || defaultPort(endpoint);
@@ -1081,7 +1464,7 @@ function createProxyTunnel(endpoint, provider, proxy) {
       timeout: REQUEST_TIMEOUT_MS
     });
 
-    activeRequest = request;
+    trackActiveRequest(requestOptions, request, null);
 
     request.once("connect", (response, socket) => {
       if (response.statusCode !== 200) {
@@ -1096,7 +1479,7 @@ function createProxyTunnel(endpoint, provider, proxy) {
         rejectUnauthorized: provider.sslVerify === true
       });
 
-      activeSocket = secureSocket;
+      trackActiveRequest(requestOptions, request, secureSocket);
 
       secureSocket.once("secureConnect", () => {
         resolve(secureSocket);
@@ -1112,10 +1495,12 @@ function createProxyTunnel(endpoint, provider, proxy) {
   });
 }
 
-function requestWithOptions(transport, options, body, onEvent) {
+function requestWithOptions(transport, options, body, onEvent, requestOptions) {
   return new Promise((resolve, reject) => {
     let settled = false;
     let content = "";
+    let reasoning = "";
+    let usage = null;
     let rawBody = "";
     let errorBody = "";
     const parser = createSseParser((data) => {
@@ -1128,12 +1513,24 @@ function requestWithOptions(transport, options, body, onEvent) {
         throw new Error(parsed.error.message || JSON.stringify(parsed.error));
       }
 
+      const parsedUsage = normalizeCompletionUsage(parsed.usage);
+      if (parsedUsage) {
+        usage = parsedUsage;
+        emit(onEvent, { type: "usage", usage });
+      }
+
       const choices = Array.isArray(parsed.choices) ? parsed.choices : [];
       choices.forEach((choice) => {
-        const delta =
-          (choice.delta && choice.delta.content) ||
-          (choice.message && choice.message.content) ||
+        const reasoningDelta =
+          extractReasoningText(choice.delta) ||
+          extractReasoningText(choice.message) ||
           "";
+        if (reasoningDelta) {
+          reasoning += reasoningDelta;
+          emit(onEvent, { type: "reasoning_delta", text: reasoningDelta });
+        }
+
+        const delta = extractContentText(choice.delta) || extractContentText(choice.message) || "";
         if (delta) {
           content += delta;
           emit(onEvent, { type: "delta", text: delta });
@@ -1187,12 +1584,21 @@ function requestWithOptions(transport, options, body, onEvent) {
         try {
           parser.flush();
           if (!content && rawBody.trim().startsWith("{")) {
-            content = extractNonStreamContent(rawBody);
+            const result = extractNonStreamResult(rawBody);
+            content = result.content;
+            reasoning = result.reasoning;
+            usage = result.usage || usage;
+            if (usage) {
+              emit(onEvent, { type: "usage", usage });
+            }
+            if (reasoning) {
+              emit(onEvent, { type: "reasoning_delta", text: reasoning });
+            }
             if (content) {
               emit(onEvent, { type: "delta", text: content });
             }
           }
-          finish(null, content);
+          finish(null, { content, usage });
         } catch (error) {
           finish(error);
         }
@@ -1201,10 +1607,10 @@ function requestWithOptions(transport, options, body, onEvent) {
       response.on("error", finish);
     });
 
-    activeRequest = request;
+    trackActiveRequest(requestOptions, request, null);
 
     request.on("socket", (socket) => {
-      activeSocket = socket;
+      trackActiveRequest(requestOptions, request, socket);
     });
     request.once("timeout", () => {
       request.destroy(new Error("请求超时"));
@@ -1212,6 +1618,20 @@ function requestWithOptions(transport, options, body, onEvent) {
     request.once("error", finish);
     request.write(body);
     request.end();
+  });
+}
+
+function trackActiveRequest(requestOptions, request, socket) {
+  const requestId = requestOptions && requestOptions.requestId;
+  if (!requestId) {
+    activeRequest = request || null;
+    activeSocket = socket || activeSocket || null;
+    return;
+  }
+  const previous = activeChatRequests.get(requestId) || {};
+  activeChatRequests.set(requestId, {
+    request: request || previous.request || null,
+    socket: socket || previous.socket || null
   });
 }
 
@@ -1295,20 +1715,121 @@ function parseSseEvent(eventText, onData) {
   onData(dataLines.join("\n"));
 }
 
-function extractNonStreamContent(rawBody) {
+function extractNonStreamResult(rawBody) {
   const parsed = JSON.parse(rawBody);
   const choices = Array.isArray(parsed.choices) ? parsed.choices : [];
-  return choices
-    .map((choice) => {
-      if (choice.message && choice.message.content) {
-        return choice.message.content;
-      }
-      if (choice.delta && choice.delta.content) {
-        return choice.delta.content;
-      }
-      return "";
-    })
-    .join("");
+  const result = choices.reduce(
+    (result, choice) => {
+      result.content += extractContentText(choice.message) || extractContentText(choice.delta) || "";
+      result.reasoning += extractReasoningText(choice.message) || extractReasoningText(choice.delta) || "";
+      return result;
+    },
+    { content: "", reasoning: "", usage: normalizeCompletionUsage(parsed.usage) }
+  );
+  return result;
+}
+
+function normalizeCompletionUsage(usage) {
+  if (!usage || typeof usage !== "object") {
+    return null;
+  }
+
+  let promptTokens = normalizeTokenCount(
+    usage.prompt_tokens,
+    usage.promptTokens,
+    usage.input_tokens,
+    usage.inputTokens
+  );
+  let completionTokens = normalizeTokenCount(
+    usage.completion_tokens,
+    usage.completionTokens,
+    usage.output_tokens,
+    usage.outputTokens
+  );
+  let totalTokens = normalizeTokenCount(usage.total_tokens, usage.totalTokens);
+
+  if (totalTokens === null && (promptTokens !== null || completionTokens !== null)) {
+    totalTokens = (promptTokens || 0) + (completionTokens || 0);
+  }
+  if (promptTokens === null && totalTokens !== null && completionTokens !== null) {
+    promptTokens = Math.max(0, totalTokens - completionTokens);
+  }
+  if (completionTokens === null && totalTokens !== null && promptTokens !== null) {
+    completionTokens = Math.max(0, totalTokens - promptTokens);
+  }
+
+  if (promptTokens === null && completionTokens === null && totalTokens === null) {
+    return null;
+  }
+
+  return {
+    prompt_tokens: promptTokens || 0,
+    completion_tokens: completionTokens || 0,
+    total_tokens: totalTokens || 0
+  };
+}
+
+function normalizeTokenCount() {
+  for (let index = 0; index < arguments.length; index += 1) {
+    const value = arguments[index];
+    const number = Number(value);
+    if (Number.isFinite(number) && number >= 0) {
+      return Math.round(number);
+    }
+  }
+  return null;
+}
+
+function extractContentText(source) {
+  if (!source || typeof source !== "object") {
+    return "";
+  }
+  return typeof source.content === "string" ? source.content : "";
+}
+
+function extractReasoningText(source) {
+  if (!source || typeof source !== "object") {
+    return "";
+  }
+
+  const candidates = [
+    source.reasoning_content,
+    source.reasoningContent,
+    source.reasoning_text,
+    source.reasoningText,
+    source.thinking,
+    source.thought,
+    source.thoughts,
+    source.reasoning,
+    source.reasoning_details,
+    source.reasoningDetails
+  ];
+
+  for (const candidate of candidates) {
+    const text = stringifyReasoningValue(candidate);
+    if (text) {
+      return text;
+    }
+  }
+  return "";
+}
+
+function stringifyReasoningValue(value) {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map(stringifyReasoningValue).filter(Boolean).join("");
+  }
+  if (value && typeof value === "object") {
+    return (
+      stringifyReasoningValue(value.text) ||
+      stringifyReasoningValue(value.content) ||
+      stringifyReasoningValue(value.delta) ||
+      ""
+    );
+  }
+  return "";
 }
 
 function extractModelNames(value) {
@@ -1365,11 +1886,47 @@ function normalizeConfig(config) {
   );
 
   return {
+    dataDir: normalizeDataDir(source.dataDir),
+    recentClipboardMs: normalizeRecentClipboardMs(source.recentClipboardMs),
+    clipboardPollingMs: normalizeClipboardPollingMs(source.clipboardPollingMs),
     providers,
     defaultProviderId: providers.length ? defaultProviderId : "",
     defaultModelId: providers.length ? defaultModelId : "",
     modeModels
   };
+}
+
+function normalizeDataDir(value) {
+  const dataDir = String(value || "").trim();
+  if (!dataDir) {
+    return DEFAULT_DATA_DIR;
+  }
+  if (dataDir === "~") {
+    return os.homedir() || DEFAULT_DATA_DIR;
+  }
+  if (dataDir.startsWith("~/") || dataDir.startsWith("~\\")) {
+    return path.join(os.homedir() || DEFAULT_DATA_DIR, dataDir.slice(2));
+  }
+  if (process.platform !== "win32" && /^[a-z]:[\\/]/i.test(dataDir)) {
+    return DEFAULT_DATA_DIR;
+  }
+  return path.resolve(dataDir);
+}
+
+function normalizeRecentClipboardMs(value) {
+  const milliseconds = Number(value);
+  if (!Number.isFinite(milliseconds)) {
+    return DEFAULT_RECENT_CLIPBOARD_MS;
+  }
+  return Math.max(0, Math.min(60000, Math.round(milliseconds)));
+}
+
+function normalizeClipboardPollingMs(value) {
+  const milliseconds = Number(value);
+  if (!Number.isFinite(milliseconds)) {
+    return DEFAULT_CLIPBOARD_POLL_MS;
+  }
+  return Math.max(100, Math.min(60000, Math.round(milliseconds)));
 }
 
 function normalizeModeModels(source, providers, fallbackSelection) {
@@ -1380,11 +1937,11 @@ function normalizeModeModels(source, providers, fallbackSelection) {
       providerId: item && typeof item.providerId === "string" ? item.providerId : "",
       modelId: item && typeof item.modelId === "string" ? item.modelId : ""
     };
-    if (!resolveProviderModel(providers, selection.providerId, selection.modelId)) {
+    if (!resolveProviderModel(providers, selection.providerId, selection.modelId, mode)) {
       selection = fallbackSelection || { providerId: "", modelId: "" };
     }
-    if (!resolveProviderModel(providers, selection.providerId, selection.modelId)) {
-      const first = getFirstProviderModel(providers);
+    if (!resolveProviderModel(providers, selection.providerId, selection.modelId, mode)) {
+      const first = getFirstProviderModel(providers, mode);
       selection = first
         ? { providerId: first.id, modelId: first.modelId }
         : { providerId: "", modelId: "" };
@@ -1414,7 +1971,7 @@ function normalizeProvider(provider) {
 }
 
 function normalizeModels(source) {
-  if (Array.isArray(source.models) && source.models.length) {
+  if (Array.isArray(source.models)) {
     return source.models.map(normalizeModel);
   }
   return [
@@ -1520,6 +2077,7 @@ function normalizeSession(session) {
     title: typeof session.title === "string" && session.title ? session.title : "新会话",
     providerId: typeof session.providerId === "string" ? session.providerId : "",
     modelId: typeof session.modelId === "string" ? session.modelId : "",
+    unreadCompleted: session.unreadCompleted === true,
     createdAt: Number(session.createdAt) || Date.now(),
     updatedAt: Number(session.updatedAt) || Date.now(),
     messages: Array.isArray(session.messages)
@@ -1536,12 +2094,62 @@ function normalizeStoredMessage(message) {
   return {
     id: typeof message.id === "string" && message.id ? message.id : createStorageId("message"),
     role: message.role === "assistant" ? "assistant" : "user",
+    type: message.type === "clear" ? "clear" : "",
     content: typeof message.content === "string" ? message.content : "",
+    reasoning: typeof message.reasoning === "string" ? message.reasoning : "",
+    usage: normalizeCompletionUsage(message.usage),
+    metrics: normalizeStoredMetrics(message.metrics),
     attachments: Array.isArray(message.attachments)
       ? message.attachments.map(normalizeStoredAttachment).filter(Boolean)
       : [],
     createdAt: Number(message.createdAt) || Date.now()
   };
+}
+
+function normalizeStoredMetrics(metrics) {
+  if (!metrics || typeof metrics !== "object") {
+    return null;
+  }
+
+  const normalized = {
+    completion_tokens: normalizeTokenCount(metrics.completion_tokens, metrics.completionTokens) || 0,
+    time_completion_millsec: normalizeMilliseconds(
+      metrics.time_completion_millsec,
+      metrics.timeCompletionMillsec
+    ),
+    time_first_token_millsec: normalizeMilliseconds(
+      metrics.time_first_token_millsec,
+      metrics.timeFirstTokenMillsec
+    ),
+    time_thinking_millsec: normalizeMilliseconds(
+      metrics.time_thinking_millsec,
+      metrics.timeThinkingMillsec,
+      metrics.thinking_millsec,
+      metrics.thinkingMillsec
+    )
+  };
+
+  if (
+    !normalized.completion_tokens &&
+    !normalized.time_completion_millsec &&
+    !normalized.time_first_token_millsec &&
+    !normalized.time_thinking_millsec
+  ) {
+    return null;
+  }
+
+  return normalized;
+}
+
+function normalizeMilliseconds() {
+  for (let index = 0; index < arguments.length; index += 1) {
+    const value = arguments[index];
+    const number = Number(value);
+    if (Number.isFinite(number) && number >= 0) {
+      return Math.round(number);
+    }
+  }
+  return 0;
 }
 
 function normalizeStoredAttachment(attachment) {

@@ -8,68 +8,73 @@
   },
   "features": [
     {
-      "code": "markmind-translate",
-      "explain": "MarkMind 翻译",
+      "code": "ai-agent-chat",
+      "explain": "AI Agent",
       "icon": "logo.svg",
       "cmds": [
-        "MarkMind 翻译",
+        "AI Agent"
+      ]
+    },
+    {
+      "code": "ai-agent-chat-explicit",
+      "explain": "AI 对话",
+      "icon": "logo.svg",
+      "cmds": [
+        "AI 对话"
+      ]
+    },
+    {
+      "code": "ai-agent-translate",
+      "explain": "AI 翻译",
+      "icon": "logo.svg",
+      "cmds": [
+        "AI 翻译",
         "翻译",
-        "快译",
         {
           "type": "over",
-          "label": "MarkMind 翻译",
+          "label": "AI 翻译",
           "minLength": 1,
           "maxLength": 8000
         }
       ]
     },
     {
-      "code": "markmind-summary",
-      "explain": "MarkMind 总结",
+      "code": "ai-agent-summary",
+      "explain": "AI 总结",
       "icon": "logo.svg",
       "cmds": [
-        "MarkMind 总结",
+        "AI 总结",
         "总结",
         {
           "type": "over",
-          "label": "MarkMind 总结",
+          "label": "AI 总结",
           "minLength": 1,
           "maxLength": 12000
         }
       ]
     },
     {
-      "code": "markmind-explain",
-      "explain": "MarkMind 解释",
+      "code": "ai-agent-explain",
+      "explain": "AI 解释",
       "icon": "logo.svg",
       "cmds": [
-        "MarkMind 解释",
+        "AI 解释",
         "解释",
         {
           "type": "over",
-          "label": "MarkMind 解释",
+          "label": "AI 解释",
           "minLength": 1,
           "maxLength": 12000
         }
       ]
     },
     {
-      "code": "markmind-chat",
-      "explain": "MarkMind 对话",
+      "code": "ai-agent-ocr",
+      "explain": "AI OCR",
       "icon": "logo.svg",
       "cmds": [
-        "MarkMind",
-        "MarkMind 对话",
-        "AI 对话"
-      ]
-    },
-    {
-      "code": "markmind-settings",
-      "explain": "MarkMind 设置",
-      "icon": "logo.svg",
-      "cmds": [
-        "MarkMind 设置",
-        "模型设置"
+        "AI OCR",
+        "OCR"
       ]
     }
   ]

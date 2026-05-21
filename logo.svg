@@ -1,6 +1,19 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" role="img" aria-label="MarkMind">
-  <rect width="96" height="96" rx="20" fill="#fdfbf5"/>
-  <path d="M18 28c0-6 5-11 11-11h38c6 0 11 5 11 11v23c0 6-5 11-11 11H45L30 76v-14h-1c-6 0-11-5-11-11V28Z" fill="#007f78"/>
-  <path d="M35 31h26v7H45v7h13v7H45v10H35V31Z" fill="#fff"/>
-  <path d="M58 58h15l-7 16-2-7-7-2 1-7Z" fill="#b86b00"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" role="img" aria-label="AI Agent">
+  <rect width="96" height="96" rx="24" fill="#f6fbfa"/>
+  <circle cx="48" cy="50" r="35" fill="#e2f6f1"/>
+  <path d="M48 25v-8" fill="none" stroke="#007f78" stroke-width="5" stroke-linecap="round"/>
+  <circle cx="48" cy="14" r="5" fill="#00a79d"/>
+  <rect x="18" y="39" width="10" height="18" rx="5" fill="#00a79d"/>
+  <rect x="68" y="39" width="10" height="18" rx="5" fill="#00a79d"/>
+  <rect x="23" y="28" width="50" height="44" rx="19" fill="#00a79d"/>
+  <rect x="30" y="37" width="36" height="24" rx="12" fill="#ffffff"/>
+  <circle cx="40" cy="48" r="4" fill="#007f78"/>
+  <circle cx="56" cy="48" r="4" fill="#007f78"/>
+  <circle cx="38.5" cy="46.5" r="1.2" fill="#ffffff"/>
+  <circle cx="54.5" cy="46.5" r="1.2" fill="#ffffff"/>
+  <path d="M42 56c3.8 3.2 8.2 3.2 12 0" fill="none" stroke="#007f78" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="34" cy="56" r="3" fill="#ffd9d3"/>
+  <circle cx="62" cy="56" r="3" fill="#ffd9d3"/>
+  <rect x="36" y="70" width="24" height="7" rx="3.5" fill="#007f78"/>
+  <path d="M68 66l3 6 6 3-6 3-3 6-3-6-6-3 6-3 3-6Z" fill="#f4a62a"/>
 </svg>

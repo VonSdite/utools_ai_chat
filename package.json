@@ -1,9 +1,13 @@
 {
-  "name": "markmind-utools",
+  "name": "ai-agent-utools",
   "version": "0.1.0",
   "private": true,
-  "description": "A uTools OpenAI-compatible assistant for selected content and chat.",
+  "description": "AI Agent is a uTools AI assistant for chat, translation, summaries, and explanations.",
   "scripts": {
     "check": "node --check preload.js && node --check index.js"
+  },
+  "dependencies": {
+    "lucide-static": "^1.16.0",
+    "markdown-it": "^14.1.1"
   }
 }
