@@ -7,7 +7,11 @@
     "check": "node --check preload.js && node --check index.js"
   },
   "dependencies": {
+    "chardet": "^2.1.1",
+    "iconv-lite": "^0.7.2",
     "lucide-static": "^1.16.0",
-    "markdown-it": "^14.1.1"
+    "markdown-it": "^14.1.1",
+    "officeparser": "^7.0.3",
+    "word-extractor": "^1.0.4"
   }
 }

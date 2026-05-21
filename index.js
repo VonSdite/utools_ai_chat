@@ -7,6 +7,7 @@
   var DEFAULT_DATA_DIR = "D:\\utools_ai_agent";
   var EMPTY_RESULT_PLACEHOLDER = "等你投喂一点内容，我来认真变魔法。";
   var PROCESSING_PLACEHOLDER = "我正在把想法揉成答案...";
+  var CANCELLED_MESSAGE = "已取消";
   var DEFAULT_RECENT_CLIPBOARD_MS = 2000;
   var DEFAULT_CLIPBOARD_POLL_MS = 500;
   var DEFAULT_PROXY_MODE = "system";
@@ -25,7 +26,11 @@
     "txt", "md", "markdown", "csv", "tsv", "json", "jsonl", "yaml", "yml",
     "xml", "html", "htm", "log", "ini", "conf", "js", "jsx", "ts", "tsx",
     "css", "scss", "less", "py", "java", "go", "rs", "c", "cpp", "h", "hpp",
-    "cs", "php", "rb", "sh", "bat", "ps1", "sql"
+    "cs", "php", "rb", "sh", "bat", "ps1", "sql", "toml", "env", "properties",
+    "dockerfile", "vue", "svelte", "astro", "mjs", "cjs"
+  ];
+  var DOCUMENT_EXTENSIONS = [
+    "pdf", "doc", "docx", "pptx", "xlsx", "odt", "odp", "ods"
   ];
   var MAX_TEXT_ATTACHMENT_CHARS = 60000;
   var MAX_ATTACHMENTS = 3;
@@ -95,6 +100,10 @@
 
     if (api.onEnter) {
       api.onEnter(handlePluginEnter);
+    }
+
+    if (api.onOut) {
+      api.onOut(handlePluginOut);
     }
 
     if (api.getLastEnterAction) {
@@ -389,6 +398,7 @@
 
     var tab = tabFromEnterAction(action);
     setTab(tab);
+    refreshActiveView();
 
     if (tab === "settings") {
       return;
@@ -412,6 +422,7 @@
       state.taskAttachments = [];
       state.currentResult = "";
       els.inputText.value = "";
+      getActiveTaskState().cancelled = false;
       renderAttachments("task");
       renderTaskPlaceholder(EMPTY_RESULT_PLACEHOLDER);
       els.copyTaskBtn.disabled = true;
@@ -431,6 +442,35 @@
     window.setTimeout(function () {
       els.inputText.focus();
     }, 0);
+  }
+
+  function handlePluginOut(action) {
+    if (state.activeTab === "task") {
+      syncActiveTaskFromInput({ immediate: true });
+    }
+    saveTaskStoreQuietly({ immediate: true });
+    saveChatStoreQuietly();
+
+    if (action && action.isKill) {
+      if (state.running) {
+        stopActiveRequest({ showToast: false });
+      }
+      abortAllChatRuns({ showToast: false });
+    }
+  }
+
+  function refreshActiveView() {
+    if (state.activeTab === "chat") {
+      renderChat();
+      return;
+    }
+    if (state.activeTab === "task") {
+      renderActiveTaskState();
+      return;
+    }
+    if (state.activeTab === "settings") {
+      renderSettings();
+    }
   }
 
   function tabFromEnterAction(action) {
@@ -704,8 +744,8 @@
     state.currentResult = taskState.result || "";
     els.inputText.value = taskState.inputText || "";
     renderAttachments("task");
-    if (state.currentResult) {
-      renderTaskResult(state.currentResult);
+    if (state.currentResult || taskState.cancelled) {
+      renderTaskResult(state.currentResult, taskState.cancelled);
     } else {
       var processing = state.running && state.runningTaskMode === state.activeTaskMode;
       renderTaskPlaceholder(processing ? PROCESSING_PLACEHOLDER : EMPTY_RESULT_PLACEHOLDER, processing);
@@ -733,9 +773,13 @@
       state.currentResult = taskState.result;
       if (render) {
         if (state.currentResult) {
-          renderTaskResult(state.currentResult);
+          renderTaskResult(state.currentResult, taskState.cancelled);
         } else {
-          renderTaskPlaceholder(EMPTY_RESULT_PLACEHOLDER);
+          if (taskState.cancelled) {
+            renderTaskResult("", true);
+          } else {
+            renderTaskPlaceholder(EMPTY_RESULT_PLACEHOLDER);
+          }
         }
       }
       els.copyTaskBtn.disabled = !state.currentResult;
@@ -747,6 +791,22 @@
   function appendTaskResult(mode, text) {
     var taskState = getTaskState(mode);
     syncTaskResult(mode, (taskState.result || "") + (text || ""), true);
+  }
+
+  function markTaskCancelled(mode, options) {
+    var taskState = getTaskState(mode);
+    taskState.cancelled = true;
+    taskState.updatedAt = Date.now();
+    if (mode === state.activeTaskMode) {
+      state.currentResult = taskState.result || "";
+      renderTaskResult(state.currentResult, true);
+      els.copyTaskBtn.disabled = !state.currentResult;
+      updateContinueChatButton();
+    }
+    saveTaskStoreQuietly({ immediate: true });
+    if (options && options.showToast) {
+      showToast(CANCELLED_MESSAGE);
+    }
   }
 
   async function startTask() {
@@ -776,6 +836,7 @@
     state.running = true;
     state.runningTaskMode = mode;
     state.currentResult = "";
+    getTaskState(mode).cancelled = false;
     syncTaskResult(mode, "", false);
     renderTaskPlaceholder(PROCESSING_PLACEHOLDER, true);
     els.sendTaskBtn.disabled = true;
@@ -844,33 +905,35 @@
     }
 
     if (event.type === "error") {
+      if (isCancelErrorMessage(event.message)) {
+        if (getTaskState(mode).cancelled) {
+          markTaskCancelled(mode);
+        }
+        return;
+      }
       handleTaskError(new Error(event.message || "请求失败"), mode);
     }
   }
 
   function handleTaskError(error, mode) {
     var message = getErrorMessage(error);
+    getTaskState(mode || state.activeTaskMode).cancelled = false;
     syncTaskResult(mode || state.activeTaskMode, "这次没有成功：\n" + message, true);
     showToast(message);
   }
 
-  function stopActiveRequest() {
+  function stopActiveRequest(options) {
+    var settings = Object.assign({ showToast: true }, options || {});
+    var mode = state.runningTaskMode || state.activeTaskMode;
+    state.running = false;
+    state.runningTaskMode = "";
+    markTaskCancelled(mode, { showToast: settings.showToast });
     if (api.abortActive) {
       api.abortActive();
     }
-    state.running = false;
-    var mode = state.runningTaskMode || state.activeTaskMode;
-    state.runningTaskMode = "";
     els.sendTaskBtn.disabled = false;
     els.stopTaskBtn.disabled = true;
     renderChatRunControls();
-    if (
-      mode === state.activeTaskMode &&
-      !state.currentResult &&
-      els.resultText.classList.contains("is-processing")
-    ) {
-      renderTaskPlaceholder(EMPTY_RESULT_PLACEHOLDER);
-    }
     updateContinueChatButton();
     saveTaskStoreQuietly({ immediate: true });
   }
@@ -882,7 +945,7 @@
       renderChatRunControls();
       return;
     }
-    abortChatRun(run.requestId);
+    abortChatRun(run.requestId, { showToast: true });
   }
 
   function clearTask() {
@@ -892,6 +955,7 @@
     els.inputText.value = "";
     state.taskAttachments = [];
     state.currentResult = "";
+    getActiveTaskState().cancelled = false;
     syncActiveTaskFromInput({ immediate: true });
     renderTaskPlaceholder(EMPTY_RESULT_PLACEHOLDER);
     els.copyTaskBtn.disabled = true;
@@ -919,9 +983,9 @@
     }
   }
 
-  function renderTaskResult(text) {
+  function renderTaskResult(text, cancelled) {
     els.resultText.classList.remove("is-placeholder", "is-processing");
-    els.resultText.innerHTML = renderMarkdown(text);
+    els.resultText.innerHTML = (text ? renderMarkdown(text) : "") + (cancelled ? renderCancelDivider() : "");
   }
 
   function renderTaskPlaceholder(text, processing) {
@@ -974,6 +1038,7 @@
     state.taskAttachments = [];
     state.currentResult = "";
     els.inputText.value = "";
+    getActiveTaskState().cancelled = false;
     syncActiveTaskFromInput({ immediate: true });
     renderAttachments("task");
     renderTaskPlaceholder(EMPTY_RESULT_PLACEHOLDER);
@@ -1072,6 +1137,11 @@
       name: attachment.name || "附件",
       mime: attachment.mime || (kind === "image" ? "image/png" : "text/plain"),
       size: Number(attachment.size) || 0,
+      extension: attachment.extension || getAttachmentExtension(attachment.name || ""),
+      cacheKey: attachment.cacheKey || "",
+      cacheFile: attachment.cacheFile || "",
+      textFile: attachment.textFile || "",
+      textTruncated: attachment.textTruncated === true,
       text: kind === "document" ? String(attachment.text || "") : "",
       dataUrl: kind === "image" ? String(attachment.dataUrl || "") : ""
     };
@@ -1251,8 +1321,12 @@
       };
     }
 
+    if (isDocumentLikeFile(file)) {
+      throw new Error("请在 uTools 中通过附件按钮选择 PDF/Office 文档");
+    }
+
     if (!isTextLikeFile(file)) {
-      throw new Error("暂时只能读取文本类文档");
+      throw new Error("暂时只能读取文本、PDF 和 Office 文档");
     }
 
     var text = await readFileAsText(file);
@@ -1273,8 +1347,17 @@
     if (/^text\//i.test(file.type || "")) {
       return true;
     }
-    var extension = file.name.split(".").pop().toLowerCase();
+    var extension = getAttachmentExtension(file.name);
     return TEXT_EXTENSIONS.indexOf(extension) >= 0;
+  }
+
+  function isDocumentLikeFile(file) {
+    return DOCUMENT_EXTENSIONS.indexOf(getAttachmentExtension(file.name)) >= 0;
+  }
+
+  function getAttachmentExtension(name) {
+    var parts = String(name || "").split(".");
+    return parts.length > 1 ? parts.pop().toLowerCase() : "";
   }
 
   function readFileAsText(file) {
@@ -1958,6 +2041,7 @@
     var contentClass = isAssistant ? "message-content markdown-body" : "message-content";
     var reasoningHtml = isAssistant ? renderReasoningBlock(message) : "";
     var loadingHtml = isAssistant && message.loading ? renderMessageLoader() : "";
+    var cancelledHtml = isAssistant && message.cancelled ? renderCancelDivider() : "";
     var statsHtml = isAssistant ? renderMessageStats(message) : "";
     var attachmentHtml = attachments.length
       ? '<div class="message-attachments">' +
@@ -1995,6 +2079,7 @@
       contentHtml +
       "</div>" +
       loadingHtml +
+      cancelledHtml +
       attachmentHtml +
       statsHtml +
       "</div>"
@@ -2056,6 +2141,18 @@
     );
   }
 
+  function renderCancelDivider() {
+    return (
+      '<div class="cancel-divider">' +
+      "<span></span>" +
+      "<strong>" +
+      CANCELLED_MESSAGE +
+      "</strong>" +
+      "<span></span>" +
+      "</div>"
+    );
+  }
+
   function renderReasoningBlock(message) {
     var reasoning = String(message.reasoning || "").trim();
     if (!reasoning) {
@@ -2090,7 +2187,7 @@
   }
 
   function renderMessageStats(message) {
-    if (!message || message.loading || message._failed) {
+    if (!message || message.loading || message._failed || message.cancelled) {
       return "";
     }
 
@@ -2488,9 +2585,10 @@
         }
       );
     } catch (error) {
-      if (!errorHandled && getErrorMessage(error) !== "请求已取消") {
+      if (!errorHandled && !isCancelErrorMessage(getErrorMessage(error))) {
         assistantMessage.loading = false;
         assistantMessage._failed = true;
+        assistantMessage.cancelled = false;
         assistantMessage.content = "这次没有成功：\n" + getErrorMessage(error);
         showToast(getErrorMessage(error));
       }
@@ -2550,8 +2648,13 @@
     }
 
     if (event.type === "error") {
+      if (isCancelErrorMessage(event.message)) {
+        markMessageCancelled(assistantMessage, run);
+        return;
+      }
       assistantMessage.loading = false;
       assistantMessage._failed = true;
+      assistantMessage.cancelled = false;
       assistantMessage.content = "这次没有成功：\n" + (event.message || "请求失败");
       updateRenderedChatMessage(assistantMessage, run);
       showToast(event.message || "这次没有成功");
@@ -2580,7 +2683,7 @@
     if (!run || isChatRunVisible(run)) {
       return;
     }
-    if (!message || (!message.content && !message.reasoning && !message._failed)) {
+    if (!message || (!message.content && !message.reasoning && !message._failed && !message.cancelled)) {
       return;
     }
     var assistant = findAssistantById(run.assistantId);
@@ -2624,27 +2727,46 @@
     return Object.keys(state.chatRuns || {}).length;
   }
 
-  function abortChatRun(requestId) {
+  function abortChatRun(requestId, options) {
     var run = state.chatRuns && state.chatRuns[requestId];
     if (!run) {
       return;
     }
-    if (api.abortChat) {
-      api.abortChat(requestId);
-    }
-    delete state.chatRuns[requestId];
     var assistant = findAssistantById(run.assistantId);
     var session = findSessionById(assistant, run.sessionId);
     if (session) {
       var message = findMessageById(session, run.messageId);
       if (message && message.loading) {
-        flushAssistantThinkState(message);
-        message.loading = false;
+        markMessageCancelled(message, run, options);
       }
       session.updatedAt = Date.now();
       saveChatStoreQuietly();
     }
+    if (api.abortChat) {
+      api.abortChat(requestId);
+    }
+    delete state.chatRuns[requestId];
     renderChatAfterRunChange(run);
+  }
+
+  function abortAllChatRuns(options) {
+    Object.keys(state.chatRuns || {}).forEach(function (requestId) {
+      abortChatRun(requestId, options);
+    });
+  }
+
+  function markMessageCancelled(message, run, options) {
+    if (!message) {
+      return;
+    }
+    flushAssistantThinkState(message);
+    message.loading = false;
+    message._failed = false;
+    message.cancelled = true;
+    updateRenderedChatMessage(message, run);
+    if (options && options.showToast) {
+      showToast(CANCELLED_MESSAGE);
+    }
   }
 
   function abortChatRunsForSession(sessionId) {
@@ -2957,6 +3079,7 @@
       type: "",
       content: content || "",
       reasoning: "",
+      cancelled: false,
       usage: null,
       metrics: null,
       attachments: attachments || [],
@@ -2971,6 +3094,7 @@
       type: "clear",
       content: "",
       reasoning: "",
+      cancelled: false,
       usage: null,
       metrics: null,
       attachments: [],
@@ -4257,6 +4381,7 @@
     return {
       inputText: typeof source.inputText === "string" ? source.inputText : "",
       result: typeof source.result === "string" ? source.result : "",
+      cancelled: source.cancelled === true,
       attachments: Array.isArray(source.attachments)
         ? source.attachments.map(normalizeAttachment).filter(Boolean)
         : [],
@@ -4370,6 +4495,7 @@
       type: message.type === "clear" ? "clear" : "",
       content: typeof message.content === "string" ? message.content : "",
       reasoning: typeof message.reasoning === "string" ? message.reasoning : "",
+      cancelled: message.cancelled === true,
       usage: normalizeMessageUsage(message.usage),
       metrics: normalizeMessageMetrics(message.metrics),
       attachments: Array.isArray(message.attachments)
@@ -4390,6 +4516,11 @@
       name: typeof attachment.name === "string" ? attachment.name : "附件",
       mime: typeof attachment.mime === "string" ? attachment.mime : "",
       size: Number(attachment.size) || 0,
+      extension: typeof attachment.extension === "string" ? attachment.extension : "",
+      cacheKey: typeof attachment.cacheKey === "string" ? attachment.cacheKey : "",
+      cacheFile: typeof attachment.cacheFile === "string" ? attachment.cacheFile : "",
+      textFile: typeof attachment.textFile === "string" ? attachment.textFile : "",
+      textTruncated: attachment.textTruncated === true,
       text: typeof attachment.text === "string" ? attachment.text : "",
       dataUrl: typeof attachment.dataUrl === "string" ? attachment.dataUrl : ""
     };
@@ -4944,6 +5075,11 @@
         name: attachment.name,
         mime: attachment.mime,
         size: attachment.size,
+        extension: attachment.extension || "",
+        cacheKey: attachment.cacheKey || "",
+        cacheFile: attachment.cacheFile || "",
+        textFile: attachment.textFile || "",
+        textTruncated: attachment.textTruncated === true,
         text: attachment.kind === "document" ? attachment.text || "" : "",
         dataUrl: attachment.kind === "image" ? attachment.dataUrl || "" : ""
       };
@@ -5021,6 +5157,10 @@
       return "未知错误";
     }
     return error.message || String(error);
+  }
+
+  function isCancelErrorMessage(message) {
+    return String(message || "").indexOf("请求已取消") >= 0;
   }
 
   function nowMs() {
@@ -5206,6 +5346,7 @@
       },
       abortActive: function () {},
       abortChat: function () {},
+      onOut: function () {},
       copyText: function (text) {
         return navigator.clipboard.writeText(text);
       },

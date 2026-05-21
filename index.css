@@ -1147,7 +1147,8 @@ button:disabled {
   box-shadow: 0 0 0 3px rgba(0, 127, 120, 0.14);
 }
 
-.context-clear-divider {
+.context-clear-divider,
+.cancel-divider {
   display: grid;
   grid-template-columns: minmax(18px, 1fr) auto minmax(18px, 1fr);
   align-items: center;
@@ -1158,14 +1159,21 @@ button:disabled {
   font-weight: 680;
 }
 
-.context-clear-divider span {
+.context-clear-divider span,
+.cancel-divider span {
   height: 1px;
   background: #d9e0dc;
 }
 
-.context-clear-divider strong {
+.context-clear-divider strong,
+.cancel-divider strong {
   font: inherit;
   white-space: nowrap;
+}
+
+.cancel-divider {
+  margin: 10px 0 2px;
+  color: #8a6a2f;
 }
 
 .reasoning-block {
@@ -1431,34 +1439,34 @@ button:disabled {
 .data-dir-control {
   position: relative;
   display: flex;
-  align-items: stretch;
-  gap: 0;
+  align-items: center;
+  gap: 6px;
   width: 100%;
   min-width: 0;
+  min-height: 42px;
   overflow: hidden;
   border: 1px solid var(--line);
-  border-radius: 7px;
-  background: #ffffff;
-  box-shadow: inset 0 -1px 0 rgba(31, 41, 51, 0.1);
+  border-radius: 8px;
+  padding: 4px;
+  background: #fbfdfb;
 }
 
 .data-dir-control:focus-within {
   border-color: var(--teal);
-  box-shadow:
-    0 0 0 3px rgba(0, 127, 120, 0.13),
-    inset 0 -1px 0 rgba(0, 127, 120, 0.55);
+  box-shadow: 0 0 0 3px rgba(0, 127, 120, 0.13);
 }
 
 .field .data-dir-control input {
   min-width: 0;
   flex: 1;
-  height: 36px;
-  min-height: 36px;
-  padding: 3px 10px 5px;
+  height: 32px;
+  min-height: 32px;
+  padding: 0 8px;
   border: 0;
-  border-radius: 0;
+  border-radius: 6px;
   background: transparent;
-  line-height: 20px;
+  font: inherit;
+  line-height: 32px;
 }
 
 .field .data-dir-control input:focus {
@@ -1470,16 +1478,18 @@ button:disabled {
   flex: 0 0 auto;
   display: inline-grid;
   place-items: center;
-  width: 38px;
-  min-width: 38px;
-  min-height: 36px;
-  border: 0;
-  border-left: 1px solid var(--line);
-  border-radius: 0;
+  width: 32px;
+  min-width: 32px;
+  min-height: 32px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: #ffffff;
   color: var(--muted);
 }
 
 .data-dir-picker:hover {
+  border-color: #c7d4cf;
+  background: #eef5f2;
   color: var(--ink);
 }
 

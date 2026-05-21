@@ -2,11 +2,16 @@ const http = require("node:http");
 const https = require("node:https");
 const tls = require("node:tls");
 const net = require("node:net");
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { execFileSync } = require("node:child_process");
 const { URL, fileURLToPath } = require("node:url");
+const chardet = require("chardet");
+const iconv = require("iconv-lite");
+const officeParser = require("officeparser");
+const WordExtractor = require("word-extractor");
 
 const CONFIG_KEY = "ai-agent/config/v1";
 const CHAT_STORE_KEY = "ai-agent/chats/v1";
@@ -14,9 +19,12 @@ const DEFAULT_DATA_DIR = getDefaultDataDir();
 const CHAT_STORE_FILE = "chat-store.json";
 const TASK_STORE_FILE = "task-store.json";
 const CACHE_DIR = "cache";
+const ATTACHMENT_CACHE_DIR = "attachments";
+const TEMP_CACHE_DIR = "tmp";
 const REQUEST_TIMEOUT_MS = 120000;
 const MAX_ERROR_BODY = 2000;
 const MAX_DOCUMENT_CHARS = 60000;
+const ENCODING_SAMPLE_BYTES = 1024 * 1024;
 const DEFAULT_RECENT_CLIPBOARD_MS = 2000;
 const DEFAULT_CLIPBOARD_POLL_MS = 500;
 const DEFAULT_PROXY_MODE = "system";
@@ -25,7 +33,11 @@ const TEXT_EXTENSIONS = [
   "txt", "md", "markdown", "csv", "tsv", "json", "jsonl", "yaml", "yml",
   "xml", "html", "htm", "log", "ini", "conf", "js", "jsx", "ts", "tsx",
   "css", "scss", "less", "py", "java", "go", "rs", "c", "cpp", "h", "hpp",
-  "cs", "php", "rb", "sh", "bat", "ps1", "sql"
+  "cs", "php", "rb", "sh", "bat", "ps1", "sql", "toml", "env", "properties",
+  "dockerfile", "vue", "svelte", "astro", "mjs", "cjs"
+];
+const DOCUMENT_EXTENSIONS = [
+  "pdf", "doc", "docx", "pptx", "xlsx", "odt", "odp", "ods"
 ];
 const IMAGE_MIME_BY_EXTENSION = {
   png: "image/png",
@@ -34,6 +46,16 @@ const IMAGE_MIME_BY_EXTENSION = {
   webp: "image/webp",
   gif: "image/gif",
   bmp: "image/bmp"
+};
+const DOCUMENT_MIME_BY_EXTENSION = {
+  pdf: "application/pdf",
+  doc: "application/msword",
+  docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  odt: "application/vnd.oasis.opendocument.text",
+  odp: "application/vnd.oasis.opendocument.presentation",
+  ods: "application/vnd.oasis.opendocument.spreadsheet"
 };
 
 let electronClipboard = null;
@@ -57,11 +79,22 @@ let clipboardImageChangedAt = 0;
 let clipboardWatcherTimer = null;
 let clipboardWatcherIntervalMs = 0;
 const enterListeners = new Set();
+const outListeners = new Set();
 
 if (typeof utools !== "undefined" && utools.onPluginEnter) {
   utools.onPluginEnter((action) => {
     const normalized = normalizeEnterAction(action);
     dispatchEnterAction(normalized);
+  });
+}
+
+if (typeof utools !== "undefined" && utools.onPluginOut) {
+  utools.onPluginOut((action) => {
+    const normalized = normalizeOutAction(action);
+    dispatchOutAction(normalized);
+    if (normalized.isKill) {
+      abortAllActiveRequests();
+    }
   });
 }
 
@@ -98,6 +131,10 @@ window.markMind = {
     enterListeners.add(listener);
     return () => enterListeners.delete(listener);
   },
+  onOut(listener) {
+    outListeners.add(listener);
+    return () => outListeners.delete(listener);
+  },
   getLastEnterAction() {
     return lastEnterAction;
   }
@@ -125,6 +162,30 @@ function dispatchEnterAction(action) {
   enterListeners.forEach((listener) => {
     try {
       listener(lastEnterAction);
+    } catch (error) {
+      console.error(error);
+    }
+  });
+}
+
+function normalizeOutAction(action) {
+  if (typeof action === "boolean") {
+    return { isKill: action };
+  }
+
+  if (action && typeof action === "object") {
+    return {
+      isKill: Boolean(action.isKill || action.kill || action.destroyed || action.isDestroyed)
+    };
+  }
+
+  return { isKill: false };
+}
+
+function dispatchOutAction(action) {
+  outListeners.forEach((listener) => {
+    try {
+      listener(action);
     } catch (error) {
       console.error(error);
     }
@@ -362,6 +423,13 @@ function abortChat(requestId) {
   }
 }
 
+function abortAllActiveRequests() {
+  abortActive();
+  Array.from(activeChatRequests.keys()).forEach((requestId) => {
+    abortChat(requestId);
+  });
+}
+
 function copyText(text) {
   const value = String(text || "");
   if (electronClipboard) {
@@ -404,7 +472,7 @@ function getRecentClipboardImage(maxAgeMs) {
   return clipboardSnapshotImage ? Object.assign({}, clipboardSnapshotImage) : null;
 }
 
-function readImageAttachment(payload) {
+async function readImageAttachment(payload) {
   const dataUrlAttachment = extractImageDataUrlPayload(payload);
   if (dataUrlAttachment) {
     return dataUrlAttachment;
@@ -412,7 +480,7 @@ function readImageAttachment(payload) {
 
   const filePath = normalizeLocalPayloadPath(extractImagePayloadPath(payload));
   if (filePath) {
-    const attachment = readLocalAttachmentFile(filePath);
+    const attachment = await readLocalAttachmentFile(filePath);
     return attachment && attachment.kind === "image" ? attachment : null;
   }
 
@@ -641,7 +709,7 @@ async function chooseAttachmentFiles(options) {
         ? { name: "图片", extensions: Object.keys(IMAGE_MIME_BY_EXTENSION) }
         : {
             name: "支持的附件",
-            extensions: TEXT_EXTENSIONS.concat(Object.keys(IMAGE_MIME_BY_EXTENSION))
+            extensions: TEXT_EXTENSIONS.concat(DOCUMENT_EXTENSIONS, Object.keys(IMAGE_MIME_BY_EXTENSION))
           },
       imagesOnly ? { name: "所有图片", extensions: Object.keys(IMAGE_MIME_BY_EXTENSION) } : { name: "所有文件", extensions: ["*"] }
     ]
@@ -696,14 +764,14 @@ function isDirectory(targetPath) {
   }
 }
 
-function readLocalAttachmentFiles(filePaths, options) {
+async function readLocalAttachmentFiles(filePaths, options) {
   const attachments = [];
   const errors = [];
   const imagesOnly = options && options.imagesOnly === true;
 
-  filePaths.forEach((filePath) => {
+  for (const filePath of filePaths) {
     try {
-      const attachment = readLocalAttachmentFile(filePath);
+      const attachment = await readLocalAttachmentFile(filePath);
       if (imagesOnly && attachment && attachment.kind !== "image") {
         throw new Error("OCR 只能选择图片");
       }
@@ -713,12 +781,12 @@ function readLocalAttachmentFiles(filePaths, options) {
     } catch (error) {
       errors.push(`${path.basename(filePath)}：${error.message || String(error)}`);
     }
-  });
+  }
 
   return { attachments, errors };
 }
 
-function readLocalAttachmentFile(filePath) {
+async function readLocalAttachmentFile(filePath) {
   const stat = fs.statSync(filePath);
   if (!stat.isFile()) {
     return null;
@@ -738,26 +806,171 @@ function readLocalAttachmentFile(filePath) {
     };
   }
 
-  if (!isTextLikePath(extension)) {
-    throw new Error("暂时只能读取文本类文档");
+  if (!isTextLikePath(extension) && !isDocumentLikePath(extension)) {
+    throw new Error("暂时只能读取文本、PDF 和 Office 文档");
   }
 
-  let text = fs.readFileSync(filePath, "utf8");
-  if (text.length > MAX_DOCUMENT_CHARS) {
-    text = text.slice(0, MAX_DOCUMENT_CHARS);
+  const config = getConfig();
+  const extractedText = isDocumentLikePath(extension)
+    ? await extractDocumentText(filePath, extension, config)
+    : readTextFileWithAutoEncoding(filePath);
+  if (!extractedText.trim()) {
+    throw new Error("未提取到可用文本");
   }
-  return {
+  const cached = cacheAttachmentDocument(filePath, extractedText, config, extension);
+
+  return Object.assign({
     id: createStorageId("file"),
     kind: "document",
     name,
-    mime: "text/plain",
+    mime: getAttachmentMime(extension),
     size: stat.size,
-    text
-  };
+    extension,
+    text: sliceDocumentText(extractedText),
+    textTruncated: extractedText.length > MAX_DOCUMENT_CHARS
+  }, cached);
 }
 
 function isTextLikePath(extension) {
   return TEXT_EXTENSIONS.includes(extension);
+}
+
+function isDocumentLikePath(extension) {
+  return DOCUMENT_EXTENSIONS.includes(extension);
+}
+
+async function extractDocumentText(filePath, extension, config) {
+  try {
+    if (extension === "doc") {
+      const extractor = new WordExtractor();
+      const extracted = await extractor.extract(filePath);
+      return normalizeExtractedText(extracted.getBody());
+    }
+
+    const tempDir = getTempCacheDir(config);
+    fs.mkdirSync(tempDir, { recursive: true });
+    const parseOffice = officeParser.parseOfficeAsync || officeParser.parseOffice;
+    const text = await parseOffice(filePath, {
+      tempFilesLocation: tempDir
+    });
+    return normalizeExtractedText(text);
+  } catch (error) {
+    throw new Error("文档解析失败：" + (error.message || String(error)));
+  }
+}
+
+function readTextFileWithAutoEncoding(filePath) {
+  const data = fs.readFileSync(filePath);
+  const detected = detectFileEncoding(filePath);
+  const encodings = uniqueValues([
+    detected,
+    "UTF-8",
+    "GB18030",
+    "GBK",
+    "Big5"
+  ]);
+
+  for (const encoding of encodings) {
+    try {
+      const content = iconv.decode(data, encoding);
+      if (!content.includes("\uFFFD")) {
+        return normalizeExtractedText(content);
+      }
+    } catch (error) {
+      // Try the next likely encoding.
+    }
+  }
+
+  return normalizeExtractedText(iconv.decode(data, "UTF-8"));
+}
+
+function detectFileEncoding(filePath) {
+  try {
+    return chardet.detectFileSync(filePath, { sampleSize: ENCODING_SAMPLE_BYTES }) || "";
+  } catch (error) {
+    return "";
+  }
+}
+
+function uniqueValues(values) {
+  const seen = new Set();
+  return values
+    .map((value) => String(value || "").trim())
+    .filter((value) => {
+      const key = value.toLowerCase();
+      if (!key || seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    });
+}
+
+function normalizeExtractedText(value) {
+  let text = value;
+  if (value && typeof value === "object") {
+    if (typeof value.toText === "function") {
+      text = value.toText();
+    } else if (Array.isArray(value.content)) {
+      text = value.content.map(extractParsedContentText).filter(Boolean).join("\n");
+    }
+  }
+  return String(text || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim();
+}
+
+function extractParsedContentText(node) {
+  if (!node || typeof node !== "object") {
+    return "";
+  }
+  if (typeof node.text === "string") {
+    return node.text;
+  }
+  if (Array.isArray(node.children)) {
+    return node.children.map(extractParsedContentText).filter(Boolean).join(" ");
+  }
+  return "";
+}
+
+function sliceDocumentText(text) {
+  const value = String(text || "");
+  return value.length > MAX_DOCUMENT_CHARS ? value.slice(0, MAX_DOCUMENT_CHARS) : value;
+}
+
+function cacheAttachmentDocument(filePath, extractedText, config, extension) {
+  const hash = hashFile(filePath);
+  const cacheDir = getAttachmentCacheDir(config);
+  fs.mkdirSync(cacheDir, { recursive: true });
+
+  const safeExt = extension ? `.${extension}` : path.extname(filePath).toLowerCase();
+  const originalPath = path.join(cacheDir, `${hash}${safeExt}`);
+  const textPath = path.join(cacheDir, `${hash}.txt`);
+
+  if (!fs.existsSync(originalPath)) {
+    fs.copyFileSync(filePath, originalPath);
+  }
+  fs.writeFileSync(textPath, String(extractedText || ""), "utf8");
+
+  return {
+    cacheKey: hash,
+    cacheFile: toDataDirRelativePath(config, originalPath),
+    textFile: toDataDirRelativePath(config, textPath)
+  };
+}
+
+function hashFile(filePath) {
+  const hash = crypto.createHash("sha256");
+  hash.update(fs.readFileSync(filePath));
+  return hash.digest("hex");
+}
+
+function getAttachmentMime(extension) {
+  if (DOCUMENT_MIME_BY_EXTENSION[extension]) {
+    return DOCUMENT_MIME_BY_EXTENSION[extension];
+  }
+  if (extension === "csv") {
+    return "text/csv";
+  }
+  return "text/plain";
 }
 
 function readChatStoreFile(config) {
@@ -812,6 +1025,45 @@ function getTaskStorePath(config) {
 function ensureDataDirectory(dataDir) {
   fs.mkdirSync(dataDir, { recursive: true });
   fs.mkdirSync(path.join(dataDir, CACHE_DIR), { recursive: true });
+  fs.mkdirSync(path.join(dataDir, CACHE_DIR, ATTACHMENT_CACHE_DIR), { recursive: true });
+  fs.mkdirSync(path.join(dataDir, CACHE_DIR, TEMP_CACHE_DIR), { recursive: true });
+}
+
+function getAttachmentCacheDir(config) {
+  const dataDir = normalizeDataDir(config && config.dataDir);
+  ensureDataDirectory(dataDir);
+  return path.join(dataDir, CACHE_DIR, ATTACHMENT_CACHE_DIR);
+}
+
+function getTempCacheDir(config) {
+  const dataDir = normalizeDataDir(config && config.dataDir);
+  ensureDataDirectory(dataDir);
+  return path.join(dataDir, CACHE_DIR, TEMP_CACHE_DIR);
+}
+
+function toDataDirRelativePath(config, filePath) {
+  const dataDir = normalizeDataDir(config && config.dataDir);
+  const relative = path.relative(dataDir, filePath);
+  return relative && !relative.startsWith("..") && !path.isAbsolute(relative)
+    ? relative
+    : filePath;
+}
+
+function resolveDataDirPath(config, relativePath) {
+  const value = String(relativePath || "").trim();
+  if (!value) {
+    return "";
+  }
+  if (path.isAbsolute(value)) {
+    return value;
+  }
+  const dataDir = normalizeDataDir(config && config.dataDir);
+  const resolved = path.resolve(dataDir, value);
+  const relative = path.relative(dataDir, resolved);
+  if (relative.startsWith("..") || path.isAbsolute(relative)) {
+    return "";
+  }
+  return resolved;
 }
 
 function normalizeMode(mode) {
@@ -940,7 +1192,7 @@ function taskSystemPrompt(mode) {
 }
 
 function buildUserContent(text, attachments, provider, fallbackText) {
-  const documents = attachments.filter((attachment) => attachment.kind === "document" && attachment.text);
+  const documents = attachments.filter((attachment) => attachment.kind === "document" && getDocumentTextForPrompt(attachment));
   const images = attachments.filter((attachment) => attachment.kind === "image" && attachment.dataUrl);
   let contentText = text || "";
 
@@ -949,7 +1201,7 @@ function buildUserContent(text, attachments, provider, fallbackText) {
       (contentText ? "\n\n" : "") +
       documents
         .map((document) => {
-          const textContent = String(document.text || "").slice(0, MAX_DOCUMENT_CHARS);
+          const textContent = getDocumentTextForPrompt(document);
           return `【文档：${document.name}】\n${textContent}`;
         })
         .join("\n\n");
@@ -985,6 +1237,33 @@ function buildUserContent(text, attachments, provider, fallbackText) {
   return content;
 }
 
+function getDocumentTextForPrompt(attachment) {
+  const text = readAttachmentText(attachment);
+  return sliceDocumentText(text);
+}
+
+function readAttachmentText(attachment) {
+  if (!attachment || attachment.kind !== "document") {
+    return "";
+  }
+  if (attachment.text) {
+    return String(attachment.text);
+  }
+  if (!attachment.textFile) {
+    return "";
+  }
+
+  const filePath = resolveDataDirPath(getConfig(), attachment.textFile);
+  if (!filePath) {
+    return "";
+  }
+  try {
+    return fs.readFileSync(filePath, "utf8");
+  } catch (error) {
+    return "";
+  }
+}
+
 function normalizeAttachments(attachments) {
   if (!Array.isArray(attachments)) {
     return [];
@@ -1002,6 +1281,11 @@ function normalizeAttachments(attachments) {
         name: typeof attachment.name === "string" ? attachment.name : "附件",
         mime: typeof attachment.mime === "string" ? attachment.mime : "",
         size: Number(attachment.size) || 0,
+        extension: typeof attachment.extension === "string" ? attachment.extension : "",
+        cacheKey: typeof attachment.cacheKey === "string" ? attachment.cacheKey : "",
+        cacheFile: typeof attachment.cacheFile === "string" ? attachment.cacheFile : "",
+        textFile: typeof attachment.textFile === "string" ? attachment.textFile : "",
+        textTruncated: attachment.textTruncated === true,
         text: typeof attachment.text === "string" ? attachment.text : "",
         dataUrl: typeof attachment.dataUrl === "string" ? attachment.dataUrl : ""
       };
@@ -2120,6 +2404,7 @@ function normalizeTaskStoreEntry(entry) {
   return {
     inputText: typeof source.inputText === "string" ? source.inputText : "",
     result: typeof source.result === "string" ? source.result : "",
+    cancelled: source.cancelled === true,
     attachments: Array.isArray(source.attachments)
       ? source.attachments.map(normalizeStoredAttachment).filter(Boolean)
       : [],
@@ -2186,6 +2471,7 @@ function normalizeStoredMessage(message) {
     type: message.type === "clear" ? "clear" : "",
     content: typeof message.content === "string" ? message.content : "",
     reasoning: typeof message.reasoning === "string" ? message.reasoning : "",
+    cancelled: message.cancelled === true,
     usage: normalizeCompletionUsage(message.usage),
     metrics: normalizeStoredMetrics(message.metrics),
     attachments: Array.isArray(message.attachments)
@@ -2253,6 +2539,11 @@ function normalizeStoredAttachment(attachment) {
     name: typeof attachment.name === "string" ? attachment.name : "附件",
     mime: typeof attachment.mime === "string" ? attachment.mime : "",
     size: Number(attachment.size) || 0,
+    extension: typeof attachment.extension === "string" ? attachment.extension : "",
+    cacheKey: typeof attachment.cacheKey === "string" ? attachment.cacheKey : "",
+    cacheFile: typeof attachment.cacheFile === "string" ? attachment.cacheFile : "",
+    textFile: typeof attachment.textFile === "string" ? attachment.textFile : "",
+    textTruncated: attachment.textTruncated === true,
     text: kind === "document" && typeof attachment.text === "string" ? attachment.text : "",
     dataUrl: kind === "image" && typeof attachment.dataUrl === "string" ? attachment.dataUrl : ""
   };

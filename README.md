@@ -84,6 +84,6 @@ https://api.example.com/v1/chat/completions
 - 附件总数最多 3 个，图片和文档共用这个限制。
 - OCR 只能添加图片附件。
 - 图片会按 OpenAI 兼容的 `image_url` 多模态消息发送。
-- 文本类文档会解析为文本上下文随消息发送。
-- 当前不解析 PDF、DOCX、PPTX、XLSX 等二进制文档格式。
+- 文本、代码、PDF、DOC、DOCX、PPTX、XLSX、ODT、ODP、ODS 会先提取文本，再作为上下文随消息发送。
+- 文档原文件和提取后的文本会缓存到数据目录下的 `cache/attachments`，会话里保存用于发送的文本快照。
 - 数据目录可在设置中修改；Windows 默认是 `D:\utools_ai_agent`，macOS/Linux 默认是 `~/utools_ai_agent`。
