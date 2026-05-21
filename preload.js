@@ -13,7 +13,7 @@ const iconv = require("iconv-lite");
 const officeParser = require("officeparser");
 const WordExtractor = require("word-extractor");
 
-const DATA_DIR_KEY = "ai-agent/data-dir/v1";
+const DATA_DIR_KEY = "ai-chat/data-dir/v1";
 const DEFAULT_DATA_DIR = getDefaultDataDir();
 const CONFIG_FILE = "config.json";
 const CHAT_STORE_FILE = "chat-store.json";
@@ -395,7 +395,7 @@ function createCompletionHeaders(body) {
     Accept: "text/event-stream",
     "Content-Type": "application/json",
     "Content-Length": Buffer.byteLength(body),
-    "User-Agent": "AI-Agent-uTools/0.1.0"
+    "User-Agent": "AI-Chat-uTools/0.1.0"
   };
 }
 
@@ -779,9 +779,9 @@ function saveStoredDataDir(storage, dataDir) {
 
 function getDefaultDataDir() {
   if (process.platform === "win32") {
-    return "D:\\utools_ai_agent";
+    return "D:\\utools_ai_chat";
   }
-  return path.join(os.homedir() || process.cwd(), "utools_ai_agent");
+  return path.join(os.homedir() || process.cwd(), "utools_ai_chat");
 }
 
 function getDialogDefaultPath(currentDir) {
@@ -1245,7 +1245,7 @@ function buildChatMessages(messages, provider, assistant) {
   const assistantName =
     assistant && typeof assistant.name === "string" ? assistant.name.trim() : "";
   const basePrompt =
-    "你是 AI Agent，一个清晰、可靠、简洁的 AI 助手。根据用户提供的文本、图片和文档上下文回答。遇到不确定内容时说明不确定，不要编造。";
+    "你是 AI Chat，一个清晰、可靠、简洁的 AI 助手。根据用户提供的文本、图片和文档上下文回答。遇到不确定内容时说明不确定，不要编造。";
 
   return [
     {
@@ -1605,7 +1605,7 @@ async function fetchModelsFromEndpoint(endpoint, provider) {
 async function requestModelText(endpoint, provider) {
   const headers = {
     Accept: "application/json",
-    "User-Agent": "AI-Agent-uTools/0.1.0"
+    "User-Agent": "AI-Chat-uTools/0.1.0"
   };
 
   if (provider.apiKey) {

@@ -1,10 +1,10 @@
 (function () {
   "use strict";
 
-  var CONFIG_STORAGE_KEY = "ai-agent/local-config";
-  var CHAT_STORAGE_KEY = "ai-agent/local-chats";
-  var TASK_STORAGE_KEY = "ai-agent/local-tasks";
-  var DEFAULT_DATA_DIR = "D:\\utools_ai_agent";
+  var CONFIG_STORAGE_KEY = "ai-chat/local-config";
+  var CHAT_STORAGE_KEY = "ai-chat/local-chats";
+  var TASK_STORAGE_KEY = "ai-chat/local-tasks";
+  var DEFAULT_DATA_DIR = "D:\\utools_ai_chat";
   var EMPTY_RESULT_PLACEHOLDER = "等你投喂一点内容，我来认真变魔法。";
   var PROCESSING_PLACEHOLDER = "我正在把想法揉成答案...";
   var CANCELLED_MESSAGE = "已取消";
@@ -103,6 +103,8 @@
     taskSpeechUtterance: null,
     selectionSpeechText: "",
     selectionSpeechTimer: 0,
+    reasoningToggleAt: 0,
+    reasoningToggleMessageId: "",
     taskRunId: "",
     runningTaskMode: "",
     internalImagePasteAt: 0,
@@ -306,6 +308,7 @@
     });
     els.chatSlashMenu.addEventListener("click", handleChatSlashClick);
     els.chatInput.addEventListener("paste", handleChatPaste);
+    els.messagesList.addEventListener("mousedown", handleReasoningSummaryMouseDown);
     els.messagesList.addEventListener("click", handleReasoningSummaryClick);
     els.messagesList.addEventListener("click", handleCodeCopyClick);
     els.messagesList.addEventListener("mouseup", scheduleSelectionSpeechButtonUpdate);
@@ -586,27 +589,27 @@
 
   function tabFromActionCode(code) {
     var value = String(code || "").trim().toLowerCase();
-    if (value === "ai-agent-translate" || value === "markmind-translate" || value === "translate") {
+    if (value === "ai-chat-translate" || value === "markmind-translate" || value === "translate") {
       return "translate";
     }
-    if (value === "ai-agent-summary" || value === "markmind-summary" || value === "summary") {
+    if (value === "ai-chat-summary" || value === "markmind-summary" || value === "summary") {
       return "summary";
     }
-    if (value === "ai-agent-explain" || value === "markmind-explain" || value === "explain") {
+    if (value === "ai-chat-explain" || value === "markmind-explain" || value === "explain") {
       return "explain";
     }
-    if (value === "ai-agent-ocr" || value === "ocr") {
+    if (value === "ai-chat-ocr" || value === "ocr") {
       return "ocr";
     }
     if (
-      value === "ai-agent-chat" ||
-      value === "ai-agent-chat-explicit" ||
+      value === "ai-chat" ||
+      value === "ai-chat-explicit" ||
       value === "markmind-chat" ||
       value === "chat"
     ) {
       return "chat";
     }
-    if (value === "ai-agent-settings" || value === "markmind-settings" || value === "settings") {
+    if (value === "ai-chat-settings" || value === "markmind-settings" || value === "settings") {
       return "settings";
     }
     return "";
@@ -645,19 +648,19 @@
     if (!value) {
       return "";
     }
-    if (value === "翻译" || value === "ai翻译" || value === "aiagent翻译") {
+    if (value === "翻译" || value === "ai翻译" || value === "aichat翻译") {
       return "translate";
     }
-    if (value === "总结" || value === "ai总结" || value === "aiagent总结") {
+    if (value === "总结" || value === "ai总结" || value === "aichat总结") {
       return "summary";
     }
-    if (value === "解释" || value === "ai解释" || value === "aiagent解释") {
+    if (value === "解释" || value === "ai解释" || value === "aichat解释") {
       return "explain";
     }
-    if (value === "ocr" || value === "aiocr" || value === "aiagentocr") {
+    if (value === "ocr" || value === "aiocr" || value === "aichatocr") {
       return "ocr";
     }
-    if (value === "aiagent" || value === "ai对话" || value === "aiagent对话" || value === "对话") {
+    if (value === "aichat" || value === "ai对话" || value === "aichat对话" || value === "对话") {
       return "chat";
     }
     return "";
@@ -3280,35 +3283,68 @@
     );
   }
 
-  function handleReasoningSummaryClick(event) {
-    var summary = event.target.closest(".reasoning-block > summary");
-    if (!summary || !els.messagesList.contains(summary)) {
+  function handleReasoningSummaryMouseDown(event) {
+    if (event.button !== 0) {
       return;
+    }
+    var context = getReasoningSummaryContext(event.target);
+    if (!context) {
+      return;
+    }
+
+    event.preventDefault();
+    toggleReasoningBlock(context);
+    state.reasoningToggleAt = Date.now();
+    state.reasoningToggleMessageId = context.messageNode.dataset.messageId || "";
+  }
+
+  function handleReasoningSummaryClick(event) {
+    var context = getReasoningSummaryContext(event.target);
+    if (!context) {
+      return;
+    }
+
+    event.preventDefault();
+    var recentMouseToggle =
+      state.reasoningToggleMessageId === (context.messageNode.dataset.messageId || "") &&
+      Date.now() - state.reasoningToggleAt < 500;
+    if (recentMouseToggle) {
+      return;
+    }
+
+    toggleReasoningBlock(context);
+  }
+
+  function getReasoningSummaryContext(target) {
+    var summary = target && target.closest ? target.closest(".reasoning-block > summary") : null;
+    if (!summary || !els.messagesList.contains(summary)) {
+      return null;
     }
 
     var details = summary.parentElement;
     var messageNode = summary.closest("[data-message-id]");
     var message = messageNode ? findMessageById(getActiveSession(), messageNode.dataset.messageId) : null;
-    var nextOpen = !details.open;
-
-    if (message) {
-      message._reasoningOpen = nextOpen;
+    if (!details || !messageNode) {
+      return null;
     }
-    window.setTimeout(function () {
-      syncReasoningOpenState(details, messageNode, message);
-    }, 0);
+    return {
+      details: details,
+      messageNode: messageNode,
+      message: message
+    };
   }
 
-  function syncReasoningOpenState(details, messageNode, message) {
-    if (!details || !messageNode || !els.messagesList.contains(messageNode)) {
+  function toggleReasoningBlock(context) {
+    if (!context || !context.details) {
       return;
     }
-    var isOpen = Boolean(details.open);
-    if (message) {
-      message._reasoningOpen = isOpen;
+    var nextOpen = !context.details.open;
+    context.details.open = nextOpen;
+    if (context.message) {
+      context.message._reasoningOpen = nextOpen;
     }
-    if (isOpen) {
-      scrollReasoningToLatest(messageNode);
+    if (nextOpen) {
+      scrollReasoningToLatest(context.messageNode);
     }
   }
 

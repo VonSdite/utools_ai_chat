@@ -1,8 +1,8 @@
 {
-  "name": "ai-agent-utools",
+  "name": "ai-chat-utools",
   "version": "0.1.0",
   "private": true,
-  "description": "AI Agent is a uTools AI assistant for chat, translation, summaries, and explanations.",
+  "description": "AI Chat is a uTools AI assistant for chat, translation, summaries, and explanations.",
   "scripts": {
     "check": "node --check preload.js && node --check index.js",
     "release:utools": "node scripts/prepare-utools-release.js"

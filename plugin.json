@@ -8,15 +8,15 @@
   },
   "features": [
     {
-      "code": "ai-agent-chat",
-      "explain": "AI Agent",
+      "code": "ai-chat",
+      "explain": "AI Chat",
       "icon": "logo.svg",
       "cmds": [
-        "AI Agent"
+        "AI Chat"
       ]
     },
     {
-      "code": "ai-agent-chat-explicit",
+      "code": "ai-chat-explicit",
       "explain": "AI 对话",
       "icon": "logo.svg",
       "cmds": [
@@ -30,7 +30,7 @@
       ]
     },
     {
-      "code": "ai-agent-translate",
+      "code": "ai-chat-translate",
       "explain": "AI 翻译",
       "icon": "logo.svg",
       "cmds": [
@@ -45,7 +45,7 @@
       ]
     },
     {
-      "code": "ai-agent-summary",
+      "code": "ai-chat-summary",
       "explain": "AI 总结",
       "icon": "logo.svg",
       "cmds": [
@@ -60,7 +60,7 @@
       ]
     },
     {
-      "code": "ai-agent-explain",
+      "code": "ai-chat-explain",
       "explain": "AI 解释",
       "icon": "logo.svg",
       "cmds": [
@@ -75,7 +75,7 @@
       ]
     },
     {
-      "code": "ai-agent-ocr",
+      "code": "ai-chat-ocr",
       "explain": "AI OCR",
       "icon": "logo.svg",
       "cmds": [
