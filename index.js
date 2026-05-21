@@ -3,6 +3,7 @@
 
   var CONFIG_STORAGE_KEY = "ai-agent/local-config";
   var CHAT_STORAGE_KEY = "ai-agent/local-chats";
+  var TASK_STORAGE_KEY = "ai-agent/local-tasks";
   var DEFAULT_DATA_DIR = "D:\\utools_ai_agent";
   var EMPTY_RESULT_PLACEHOLDER = "等你投喂一点内容，我来认真变魔法。";
   var PROCESSING_PLACEHOLDER = "我正在把想法揉成答案...";
@@ -18,6 +19,7 @@
     explain: { title: "解释", action: "解释", placeholder: "把想弄懂的东西放这里，我来慢慢讲清楚" },
     ocr: { title: "OCR", action: "OCR", placeholder: "把图片贴过来，我来帮你认字", requiresMultimodal: true }
   };
+  var TASK_MODES = ["translate", "summary", "explain", "ocr"];
   var MODEL_MODES = ["translate", "summary", "explain", "ocr", "chat"];
   var TEXT_EXTENSIONS = [
     "txt", "md", "markdown", "csv", "tsv", "json", "jsonl", "yaml", "yml",
@@ -44,6 +46,7 @@
     activeTaskMode: "translate",
     taskAttachments: [],
     chatAttachments: [],
+    taskStore: createEmptyTaskStore(),
     chatStore: { assistants: [], activeAssistantId: "" },
     assistantsOpen: false,
     currentResult: "",
@@ -65,6 +68,8 @@
     confirmResolver: null,
     confirmPreviousFocus: null,
     settingsSaveToken: 0,
+    taskSaveTimer: 0,
+    runningTaskMode: "",
     toastTimer: 0
   };
 
@@ -77,11 +82,12 @@
     bindEvents();
     await loadConfig();
     await loadChatStore();
+    await loadTaskStore();
     renderSettings();
     renderChat();
     renderTaskModelSelect();
     renderTaskModeButtons();
-    renderTaskPlaceholder(EMPTY_RESULT_PLACEHOLDER);
+    renderActiveTaskState();
     updateViewTitle();
     renderChatSidebarState();
 
@@ -133,6 +139,7 @@
     els.chatFileInput = document.getElementById("chatFileInput");
     els.chatAttachBtn = document.getElementById("chatAttachBtn");
     els.clearContextBtn = document.getElementById("clearContextBtn");
+    els.clearChatBtn = document.getElementById("clearChatBtn");
     els.sendChatBtn = document.getElementById("sendChatBtn");
     els.stopChatBtn = document.getElementById("stopChatBtn");
     els.dataDirInput = document.getElementById("dataDirInput");
@@ -196,7 +203,10 @@
     els.inputText.addEventListener("keydown", function (event) {
       handleSubmitKeydown(event, startTask);
     });
-    els.inputText.addEventListener("input", updateContinueChatButton);
+    els.inputText.addEventListener("input", function () {
+      syncActiveTaskFromInput();
+      updateContinueChatButton();
+    });
     els.inputText.addEventListener("paste", handleTaskPaste);
 
     els.newSessionBtn.addEventListener("click", createNewSession);
@@ -213,6 +223,7 @@
     els.sendChatBtn.addEventListener("click", sendChatMessage);
     els.stopChatBtn.addEventListener("click", stopActiveChatRequest);
     els.clearContextBtn.addEventListener("click", clearChatContext);
+    els.clearChatBtn.addEventListener("click", clearCurrentChatMessages);
     els.chatAttachBtn.addEventListener("click", function () {
       chooseAttachmentFiles("chat");
     });
@@ -366,6 +377,15 @@
     }
   }
 
+  async function loadTaskStore() {
+    try {
+      state.taskStore = normalizeTaskStore(api.getTaskStore ? await api.getTaskStore() : null);
+    } catch (error) {
+      state.taskStore = normalizeTaskStore(null);
+      showToast("读取任务缓存失败：" + getErrorMessage(error));
+    }
+  }
+
   async function handlePluginEnter(action) {
     if (!action) {
       return;
@@ -392,8 +412,19 @@
       return;
     }
 
+    if (payload.text || payload.image) {
+      state.taskAttachments = [];
+      state.currentResult = "";
+      els.inputText.value = "";
+      renderAttachments("task");
+      renderTaskPlaceholder(EMPTY_RESULT_PLACEHOLDER);
+      els.copyTaskBtn.disabled = true;
+      syncActiveTaskFromInput();
+    }
+
     if (payload.text) {
       els.inputText.value = payload.text;
+      syncActiveTaskFromInput();
     }
     var addedImages = payload.image ? addPreparedAttachments("task", [payload.image]) : 0;
     if (payload.text || addedImages) {
@@ -516,13 +547,14 @@
 
   async function getEnterPayload(action, tab) {
     var selectedText = action.type === "over" ? extractPayloadText(action.payload) : "";
+    var selectedImage = action.type === "img" ? await readActionImage(action.payload) : null;
     if (tab === "ocr") {
       return {
         text: "",
-        image: selectedText ? null : await readRecentClipboardImage()
+        image: selectedImage || (selectedText ? null : await readRecentClipboardImage())
       };
     }
-    var image = selectedText ? null : await readRecentClipboardImage();
+    var image = selectedImage || (selectedText ? null : await readRecentClipboardImage());
     return {
       text: selectedText || (await readRecentClipboardText()),
       image: image
@@ -553,9 +585,24 @@
     }
   }
 
+  async function readActionImage(payload) {
+    if (!api.readImageAttachment) {
+      return null;
+    }
+    try {
+      return normalizePreparedAttachment(await api.readImageAttachment(payload));
+    } catch (error) {
+      return null;
+    }
+  }
+
   function setTab(tabName) {
     var nextTab = tabName;
+    var previousTaskMode = state.activeTaskMode;
     if (TASKS[tabName]) {
+      if (tabName !== state.activeTaskMode) {
+        syncActiveTaskFromInput({ immediate: true });
+      }
       state.activeTaskMode = tabName;
       nextTab = "task";
     }
@@ -576,6 +623,9 @@
     renderChatModelSelect();
     renderChatRunControls();
     renderChatSidebarState();
+    if (state.activeTab === "task" && previousTaskMode !== state.activeTaskMode) {
+      renderActiveTaskState();
+    }
   }
 
   function toggleChatSidebar() {
@@ -599,6 +649,9 @@
     if (!TASKS[mode]) {
       return;
     }
+    if (mode !== state.activeTaskMode) {
+      syncActiveTaskFromInput({ immediate: true });
+    }
     state.activeTaskMode = mode;
     if (state.activeTab !== "task") {
       state.activeTab = "task";
@@ -607,6 +660,7 @@
     updateViewTitle();
     renderTaskModelSelect();
     updateTaskFileAccept();
+    renderActiveTaskState();
   }
 
   function renderTaskModeButtons() {
@@ -651,12 +705,81 @@
     submit();
   }
 
+  function getTaskState(mode) {
+    var taskMode = TASKS[mode] ? mode : "translate";
+    if (!state.taskStore || !state.taskStore.modes) {
+      state.taskStore = createEmptyTaskStore();
+    }
+    if (!state.taskStore.modes[taskMode]) {
+      state.taskStore.modes[taskMode] = createTaskState();
+    }
+    return state.taskStore.modes[taskMode];
+  }
+
+  function getActiveTaskState() {
+    return getTaskState(state.activeTaskMode);
+  }
+
+  function renderActiveTaskState() {
+    var taskState = getActiveTaskState();
+    state.taskAttachments = cloneAttachments(taskState.attachments);
+    state.currentResult = taskState.result || "";
+    els.inputText.value = taskState.inputText || "";
+    renderAttachments("task");
+    if (state.currentResult) {
+      renderTaskResult(state.currentResult);
+    } else {
+      var processing = state.running && state.runningTaskMode === state.activeTaskMode;
+      renderTaskPlaceholder(processing ? PROCESSING_PLACEHOLDER : EMPTY_RESULT_PLACEHOLDER, processing);
+    }
+    els.copyTaskBtn.disabled = !state.currentResult;
+    els.sendTaskBtn.disabled = state.running;
+    els.stopTaskBtn.disabled = !state.running;
+    updateContinueChatButton();
+  }
+
+  function syncActiveTaskFromInput(options) {
+    var taskState = getActiveTaskState();
+    taskState.inputText = els.inputText.value;
+    taskState.result = state.currentResult;
+    taskState.attachments = cloneAttachments(state.taskAttachments);
+    taskState.updatedAt = Date.now();
+    saveTaskStoreQuietly(options);
+  }
+
+  function syncTaskResult(mode, result, render) {
+    var taskState = getTaskState(mode);
+    taskState.result = result || "";
+    taskState.updatedAt = Date.now();
+    if (mode === state.activeTaskMode) {
+      state.currentResult = taskState.result;
+      if (render) {
+        if (state.currentResult) {
+          renderTaskResult(state.currentResult);
+        } else {
+          renderTaskPlaceholder(EMPTY_RESULT_PLACEHOLDER);
+        }
+      }
+      els.copyTaskBtn.disabled = !state.currentResult;
+      updateContinueChatButton();
+    }
+    saveTaskStoreQuietly();
+  }
+
+  function appendTaskResult(mode, text) {
+    var taskState = getTaskState(mode);
+    syncTaskResult(mode, (taskState.result || "") + (text || ""), true);
+  }
+
   async function startTask() {
-    var text = els.inputText.value.trim();
+    syncActiveTaskFromInput({ immediate: true });
+    var taskState = getActiveTaskState();
+    var text = taskState.inputText.trim();
     var provider = getActiveProvider();
     var mode = state.activeTaskMode;
+    var attachments = cloneAttachments(taskState.attachments);
 
-    if (!text && !state.taskAttachments.length) {
+    if (!text && !attachments.length) {
       showToast("先输入一点内容");
       return;
     }
@@ -667,13 +790,15 @@
       return;
     }
 
-    if (mode === "ocr" && !hasImageAttachments(state.taskAttachments)) {
+    if (mode === "ocr" && !hasImageAttachments(attachments)) {
       showToast("先贴一张图片给 OCR");
       return;
     }
 
     state.running = true;
+    state.runningTaskMode = mode;
     state.currentResult = "";
+    syncTaskResult(mode, "", false);
     renderTaskPlaceholder(PROCESSING_PLACEHOLDER, true);
     els.sendTaskBtn.disabled = true;
     els.stopTaskBtn.disabled = false;
@@ -688,29 +813,33 @@
           text: text,
           providerId: provider.id,
           modelId: provider.modelId,
-          attachments: cloneAttachmentsForRequest(state.taskAttachments)
+          attachments: cloneAttachmentsForRequest(attachments)
         },
         function (event) {
           if (event && event.type === "error") {
             errorHandled = true;
           }
-          handleTaskEvent(event, provider);
+          handleTaskEvent(event, provider, mode);
         }
       );
     } catch (error) {
       if (!errorHandled && getErrorMessage(error) !== "请求已取消") {
-        handleTaskError(error);
+        handleTaskError(error, mode);
       }
     } finally {
       state.running = false;
+      state.runningTaskMode = "";
       els.sendTaskBtn.disabled = false;
       els.stopTaskBtn.disabled = true;
-      els.copyTaskBtn.disabled = !state.currentResult;
+      if (mode === state.activeTaskMode) {
+        els.copyTaskBtn.disabled = !state.currentResult;
+      }
       updateContinueChatButton();
+      saveTaskStoreQuietly({ immediate: true });
     }
   }
 
-  function handleTaskEvent(event, provider) {
+  function handleTaskEvent(event, provider, mode) {
     if (!event || !event.type) {
       return;
     }
@@ -720,31 +849,30 @@
     }
 
     if (event.type === "delta") {
-      state.currentResult += event.text || "";
-      renderTaskResult(state.currentResult);
-      els.resultText.scrollTop = els.resultText.scrollHeight;
-      updateContinueChatButton();
+      appendTaskResult(mode, event.text || "");
+      if (mode === state.activeTaskMode) {
+        els.resultText.scrollTop = els.resultText.scrollHeight;
+      }
       return;
     }
 
     if (event.type === "done") {
-      if (event.text && !state.currentResult) {
-        state.currentResult = event.text;
-        renderTaskResult(state.currentResult);
+      var taskState = getTaskState(mode);
+      if (event.text && !taskState.result) {
+        syncTaskResult(mode, event.text, true);
       }
-      els.copyTaskBtn.disabled = !state.currentResult;
-      updateContinueChatButton();
+      saveTaskStoreQuietly({ immediate: true });
       return;
     }
 
     if (event.type === "error") {
-      handleTaskError(new Error(event.message || "请求失败"));
+      handleTaskError(new Error(event.message || "请求失败"), mode);
     }
   }
 
-  function handleTaskError(error) {
+  function handleTaskError(error, mode) {
     var message = getErrorMessage(error);
-    renderTaskResult("这次没有成功：\n" + message);
+    syncTaskResult(mode || state.activeTaskMode, "这次没有成功：\n" + message, true);
     showToast(message);
   }
 
@@ -753,13 +881,20 @@
       api.abortActive();
     }
     state.running = false;
+    var mode = state.runningTaskMode || state.activeTaskMode;
+    state.runningTaskMode = "";
     els.sendTaskBtn.disabled = false;
     els.stopTaskBtn.disabled = true;
     renderChatRunControls();
-    if (!state.currentResult && els.resultText.classList.contains("is-processing")) {
+    if (
+      mode === state.activeTaskMode &&
+      !state.currentResult &&
+      els.resultText.classList.contains("is-processing")
+    ) {
       renderTaskPlaceholder(EMPTY_RESULT_PLACEHOLDER);
     }
     updateContinueChatButton();
+    saveTaskStoreQuietly({ immediate: true });
   }
 
   function stopActiveChatRequest() {
@@ -773,12 +908,13 @@
   }
 
   function clearTask() {
-    if (getChatRunForSession(session.id)) {
-      stopActiveChatRequest();
+    if (state.running && state.runningTaskMode === state.activeTaskMode) {
+      stopActiveRequest();
     }
     els.inputText.value = "";
     state.taskAttachments = [];
     state.currentResult = "";
+    syncActiveTaskFromInput({ immediate: true });
     renderTaskPlaceholder(EMPTY_RESULT_PLACEHOLDER);
     els.copyTaskBtn.disabled = true;
     updateContinueChatButton();
@@ -797,8 +933,10 @@
       } else if (navigator.clipboard) {
         await navigator.clipboard.writeText(state.currentResult);
       }
+      showCodeCopyState(els.copyTaskBtn, "copied", "复制");
       showToast("已复制");
     } catch (error) {
+      showCodeCopyState(els.copyTaskBtn, "failed", "复制");
       showToast("复制没成功：" + getErrorMessage(error));
     }
   }
@@ -822,7 +960,8 @@
 
   function updateContinueChatButton() {
     var hasInput = Boolean(els.inputText.value.trim() || state.taskAttachments.length);
-    els.continueChatBtn.hidden = state.running || !state.currentResult || !hasInput;
+    var activeRunning = state.running && state.runningTaskMode === state.activeTaskMode;
+    els.continueChatBtn.hidden = activeRunning || !state.currentResult || !hasInput;
   }
 
   async function continueTaskInChat() {
@@ -857,6 +996,7 @@
     state.taskAttachments = [];
     state.currentResult = "";
     els.inputText.value = "";
+    syncActiveTaskFromInput({ immediate: true });
     renderAttachments("task");
     renderTaskPlaceholder(EMPTY_RESULT_PLACEHOLDER);
     els.copyTaskBtn.disabled = true;
@@ -973,6 +1113,7 @@
     state.taskAttachments = state.taskAttachments.concat(nextAttachments);
     renderAttachments("task");
     updateContinueChatButton();
+    syncActiveTaskFromInput();
   }
 
   async function addFiles(target, fileList) {
@@ -1030,6 +1171,13 @@
       return;
     }
 
+    var provider = getChatProvider(getActiveAssistant());
+    if (!provider || provider.multimodal !== true) {
+      event.preventDefault();
+      showToast("先选择多模态模型");
+      return;
+    }
+
     event.preventDefault();
     addFiles("chat", imageFiles);
   }
@@ -1042,6 +1190,8 @@
 
     var provider = getActiveProvider();
     if (!provider || provider.multimodal !== true) {
+      event.preventDefault();
+      showToast("先选择多模态模型");
       return;
     }
 
@@ -1193,6 +1343,7 @@
       });
       renderAttachments("task");
       updateContinueChatButton();
+      syncActiveTaskFromInput();
       return;
     }
 
@@ -1898,16 +2049,16 @@
     }
   }
 
-  function showCodeCopyState(button, stateName) {
-    setCodeCopyButtonContent(button, stateName);
+  function showCodeCopyState(button, stateName, defaultTitle) {
+    setCodeCopyButtonContent(button, stateName, defaultTitle);
     window.clearTimeout(button._copyTimer);
     button._copyTimer = window.setTimeout(function () {
-      setCodeCopyButtonContent(button, "copy");
+      setCodeCopyButtonContent(button, "copy", defaultTitle);
     }, 1200);
   }
 
-  function setCodeCopyButtonContent(button, stateName) {
-    var title = stateName === "copied" ? "已复制" : stateName === "failed" ? "复制失败" : "复制代码";
+  function setCodeCopyButtonContent(button, stateName, defaultTitle) {
+    var title = stateName === "copied" ? "已复制" : stateName === "failed" ? "复制失败" : defaultTitle || "复制代码";
     button.innerHTML = getCodeCopyIcon(stateName);
     button.classList.toggle("is-copied", stateName === "copied");
     button.classList.toggle("is-failed", stateName === "failed");
@@ -2236,6 +2387,33 @@
     saveChatStoreQuietly();
     renderChat();
     showToast("已清除上下文");
+  }
+
+  async function clearCurrentChatMessages() {
+    var session = getActiveSession();
+    if (!session || !session.messages.length) {
+      showToast("当前对话还没有记录");
+      return;
+    }
+
+    if (
+      !(await showConfirmDialog({
+        title: "清空对话",
+        message: "当前对话记录会被清空。",
+        confirmText: "清空"
+      }))
+    ) {
+      return;
+    }
+
+    abortChatRunsForSession(session.id);
+    session.messages = [];
+    session.title = "新会话";
+    session.unreadCompleted = false;
+    session.updatedAt = Date.now();
+    saveChatStoreQuietly();
+    renderChat();
+    showToast("已清空对话");
   }
 
   async function sendChatMessage() {
@@ -3064,6 +3242,32 @@
     }
   }
 
+  function saveTaskStoreQuietly(options) {
+    var settings = Object.assign({ immediate: false, showError: false }, options || {});
+    window.clearTimeout(state.taskSaveTimer);
+
+    if (settings.immediate) {
+      return doSaveTaskStoreQuietly(settings);
+    }
+
+    state.taskSaveTimer = window.setTimeout(function () {
+      doSaveTaskStoreQuietly(settings);
+    }, 250);
+    return Promise.resolve();
+  }
+
+  async function doSaveTaskStoreQuietly(options) {
+    try {
+      if (api.saveTaskStore) {
+        state.taskStore = normalizeTaskStore(await api.saveTaskStore(state.taskStore));
+      }
+    } catch (error) {
+      if (options && options.showError) {
+        showToast("保存任务缓存失败：" + getErrorMessage(error));
+      }
+    }
+  }
+
   async function saveConfigQuietly() {
     try {
       if (api.saveConfig) {
@@ -3116,6 +3320,7 @@
     var saved = await saveDraftSettings({ showSuccess: true });
     if (saved) {
       await saveChatStoreQuietly({ showError: true });
+      await saveTaskStoreQuietly({ immediate: true, showError: true });
     }
   }
 
@@ -4061,6 +4266,36 @@
     };
   }
 
+  function createEmptyTaskStore() {
+    var modes = {};
+    TASK_MODES.forEach(function (mode) {
+      modes[mode] = createTaskState();
+    });
+    return { modes: modes };
+  }
+
+  function createTaskState(values) {
+    var source = values && typeof values === "object" ? values : {};
+    return {
+      inputText: typeof source.inputText === "string" ? source.inputText : "",
+      result: typeof source.result === "string" ? source.result : "",
+      attachments: Array.isArray(source.attachments)
+        ? source.attachments.map(normalizeAttachment).filter(Boolean)
+        : [],
+      updatedAt: Number(source.updatedAt) || 0
+    };
+  }
+
+  function normalizeTaskStore(store) {
+    var source = store && typeof store === "object" ? store : {};
+    var sourceModes = source.modes && typeof source.modes === "object" ? source.modes : source;
+    var modes = {};
+    TASK_MODES.forEach(function (mode) {
+      modes[mode] = createTaskState(sourceModes && sourceModes[mode]);
+    });
+    return { modes: modes };
+  }
+
   function normalizeChatStore(store) {
     var source = store && typeof store === "object" ? store : {};
     var assistants = Array.isArray(source.assistants)
@@ -4711,8 +4946,14 @@
     return "共拉取 " + total + " 个模型，已选 " + selected + " 个，其中 " + existing + " 个已在当前清单";
   }
 
+  function cloneAttachments(attachments) {
+    return (attachments || []).map(function (attachment) {
+      return Object.assign({}, attachment);
+    });
+  }
+
   function cloneAttachmentsForRequest(attachments) {
-    return attachments.map(function (attachment) {
+    return (attachments || []).map(function (attachment) {
       return Object.assign({}, attachment);
     });
   }
@@ -4953,6 +5194,17 @@
         localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(store));
         return store;
       },
+      getTaskStore: function () {
+        try {
+          return JSON.parse(localStorage.getItem(TASK_STORAGE_KEY) || "{}");
+        } catch (error) {
+          return {};
+        }
+      },
+      saveTaskStore: function (store) {
+        localStorage.setItem(TASK_STORAGE_KEY, JSON.stringify(store));
+        return store;
+      },
       chooseDataDirectory: function () {
         return "";
       },
@@ -4960,6 +5212,9 @@
         return "";
       },
       getRecentClipboardImage: function () {
+        return null;
+      },
+      readImageAttachment: function () {
         return null;
       },
       runTask: function () {

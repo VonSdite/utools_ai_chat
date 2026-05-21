@@ -20,7 +20,13 @@
       "explain": "AI 对话",
       "icon": "logo.svg",
       "cmds": [
-        "AI 对话"
+        "AI 对话",
+        {
+          "type": "over",
+          "label": "AI 对话",
+          "minLength": 1,
+          "maxLength": 12000
+        }
       ]
     },
     {
@@ -74,7 +80,11 @@
       "icon": "logo.svg",
       "cmds": [
         "AI OCR",
-        "OCR"
+        "OCR",
+        {
+          "type": "img",
+          "label": "AI OCR"
+        }
       ]
     }
   ]

@@ -6,12 +6,13 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { execFileSync } = require("node:child_process");
-const { URL } = require("node:url");
+const { URL, fileURLToPath } = require("node:url");
 
 const CONFIG_KEY = "ai-agent/config/v1";
 const CHAT_STORE_KEY = "ai-agent/chats/v1";
 const DEFAULT_DATA_DIR = getDefaultDataDir();
 const CHAT_STORE_FILE = "chat-store.json";
+const TASK_STORE_FILE = "task-store.json";
 const CACHE_DIR = "cache";
 const REQUEST_TIMEOUT_MS = 120000;
 const MAX_ERROR_BODY = 2000;
@@ -73,6 +74,8 @@ window.markMind = {
   saveConfig,
   getChatStore,
   saveChatStore,
+  getTaskStore,
+  saveTaskStore,
   runTask,
   sendChat,
   fetchModels,
@@ -88,6 +91,7 @@ window.markMind = {
   getClipboardText,
   getRecentClipboardText,
   getRecentClipboardImage,
+  readImageAttachment,
   chooseDataDirectory,
   chooseAttachmentFiles,
   onEnter(listener) {
@@ -159,6 +163,24 @@ function getChatStore() {
 function saveChatStore(store) {
   const normalized = normalizeChatStore(store);
   writeChatStoreFile(getConfig(), normalized);
+  return normalized;
+}
+
+function getTaskStore() {
+  const config = getConfig();
+  const stored = readTaskStoreFile(config);
+  if (stored) {
+    return normalizeTaskStore(stored);
+  }
+
+  const normalized = normalizeTaskStore(null);
+  writeTaskStoreFile(config, normalized);
+  return normalized;
+}
+
+function saveTaskStore(store) {
+  const normalized = normalizeTaskStore(store);
+  writeTaskStoreFile(getConfig(), normalized);
   return normalized;
 }
 
@@ -380,6 +402,79 @@ function getRecentClipboardImage(maxAgeMs) {
     return null;
   }
   return clipboardSnapshotImage ? Object.assign({}, clipboardSnapshotImage) : null;
+}
+
+function readImageAttachment(payload) {
+  const dataUrlAttachment = extractImageDataUrlPayload(payload);
+  if (dataUrlAttachment) {
+    return dataUrlAttachment;
+  }
+
+  const filePath = normalizeLocalPayloadPath(extractImagePayloadPath(payload));
+  if (filePath) {
+    const attachment = readLocalAttachmentFile(filePath);
+    return attachment && attachment.kind === "image" ? attachment : null;
+  }
+
+  return safeReadClipboardImage();
+}
+
+function extractImageDataUrlPayload(payload) {
+  if (typeof payload === "string" && /^data:image\//i.test(payload)) {
+    return {
+      id: createStorageId("file"),
+      kind: "image",
+      name: "image.png",
+      mime: getDataUrlMime(payload) || "image/png",
+      size: estimateDataUrlBytes(payload),
+      dataUrl: payload
+    };
+  }
+
+  if (payload && typeof payload === "object" && typeof payload.dataUrl === "string") {
+    return extractImageDataUrlPayload(payload.dataUrl);
+  }
+
+  return null;
+}
+
+function extractImagePayloadPath(payload) {
+  if (typeof payload === "string") {
+    return payload;
+  }
+  if (Array.isArray(payload)) {
+    for (const item of payload) {
+      const filePath = extractImagePayloadPath(item);
+      if (filePath) {
+        return filePath;
+      }
+    }
+    return "";
+  }
+  if (payload && typeof payload === "object") {
+    const candidates = [payload.path, payload.filePath, payload.file, payload.url];
+    for (const candidate of candidates) {
+      if (typeof candidate === "string" && candidate) {
+        return candidate;
+      }
+    }
+  }
+  return "";
+}
+
+function normalizeLocalPayloadPath(value) {
+  const filePath = String(value || "").trim();
+  if (!filePath) {
+    return "";
+  }
+  if (/^file:\/\//i.test(filePath)) {
+    try {
+      return fileURLToPath(filePath);
+    } catch (error) {
+      return "";
+    }
+  }
+  return filePath;
 }
 
 function startClipboardWatcher(intervalMs) {
@@ -670,6 +765,11 @@ function readChatStoreFile(config) {
   return readJsonFile(filePath);
 }
 
+function readTaskStoreFile(config) {
+  const filePath = getTaskStorePath(config);
+  return readJsonFile(filePath);
+}
+
 function readJsonFile(filePath) {
   if (!fs.existsSync(filePath)) {
     return null;
@@ -691,8 +791,22 @@ function writeChatStoreFile(config, store) {
   );
 }
 
+function writeTaskStoreFile(config, store) {
+  const dataDir = normalizeDataDir(config && config.dataDir);
+  ensureDataDirectory(dataDir);
+  fs.writeFileSync(
+    path.join(dataDir, TASK_STORE_FILE),
+    JSON.stringify(store, null, 2),
+    "utf8"
+  );
+}
+
 function getChatStorePath(config) {
   return path.join(normalizeDataDir(config && config.dataDir), CHAT_STORE_FILE);
+}
+
+function getTaskStorePath(config) {
+  return path.join(normalizeDataDir(config && config.dataDir), TASK_STORE_FILE);
 }
 
 function ensureDataDirectory(dataDir) {
@@ -1988,6 +2102,28 @@ function normalizeChatStore(store) {
   return {
     assistants,
     activeAssistantId: assistants.length ? activeAssistantId : ""
+  };
+}
+
+function normalizeTaskStore(store) {
+  const source = store && typeof store === "object" ? store : {};
+  const sourceModes = source.modes && typeof source.modes === "object" ? source.modes : source;
+  const modes = {};
+  ["translate", "summary", "explain", "ocr"].forEach((mode) => {
+    modes[mode] = normalizeTaskStoreEntry(sourceModes && sourceModes[mode]);
+  });
+  return { modes };
+}
+
+function normalizeTaskStoreEntry(entry) {
+  const source = entry && typeof entry === "object" ? entry : {};
+  return {
+    inputText: typeof source.inputText === "string" ? source.inputText : "",
+    result: typeof source.result === "string" ? source.result : "",
+    attachments: Array.isArray(source.attachments)
+      ? source.attachments.map(normalizeStoredAttachment).filter(Boolean)
+      : [],
+    updatedAt: Number(source.updatedAt) || 0
   };
 }
 
