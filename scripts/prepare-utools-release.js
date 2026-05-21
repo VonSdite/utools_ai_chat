@@ -36,8 +36,10 @@ const UNUSED_OFFICEPARSER_OCR_PACKAGES = [
 ];
 const UNUSED_PDFJS_PATHS = [
   "build",
+  "cmaps",
   "iccs",
   "image_decoders",
+  "standard_fonts",
   "types",
   "wasm",
   "web",
@@ -49,6 +51,14 @@ const UNUSED_PDFJS_PATHS = [
   path.join("legacy", "build", "pdf.sandbox.mjs"),
   path.join("legacy", "build", "pdf.worker.min.mjs")
 ];
+const UNUSED_OFFICEPARSER_PATHS = [
+  path.join("dist", "cli.js"),
+  path.join("dist", "index.mjs"),
+  path.join("dist", "officeparser.browser.iife.js"),
+  path.join("dist", "officeparser.browser.mjs"),
+  path.join("dist", "sbom.cdx.json")
+];
+const UNUSED_RELEASE_SUFFIXES = [".d.ts", ".d.mts", ".d.cts", ".map", ".js.gz"];
 
 main();
 
@@ -63,7 +73,9 @@ function main() {
   } else {
     installRuntimeDependencies();
     removeUnusedRuntimeDependencies();
+    pruneOfficeParserRuntimeFiles();
     prunePdfJsRuntimeFiles();
+    pruneUnusedReleaseFiles();
     removeTemporaryPackageFiles();
   }
 
@@ -163,10 +175,20 @@ function prunePdfJsRuntimeFiles() {
   UNUSED_PDFJS_PATHS.forEach((relativePath) => {
     fs.rmSync(path.join(pdfJsDir, relativePath), { recursive: true, force: true });
   });
-  removeFilesByExtension(pdfJsDir, ".map");
 }
 
-function removeFilesByExtension(dir, extension) {
+function pruneOfficeParserRuntimeFiles() {
+  const officeParserDir = path.join(OUT_DIR, "node_modules", "officeparser");
+  UNUSED_OFFICEPARSER_PATHS.forEach((relativePath) => {
+    fs.rmSync(path.join(officeParserDir, relativePath), { recursive: true, force: true });
+  });
+}
+
+function pruneUnusedReleaseFiles() {
+  removeFilesBySuffixes(OUT_DIR, UNUSED_RELEASE_SUFFIXES);
+}
+
+function removeFilesBySuffixes(dir, suffixes) {
   if (!fs.existsSync(dir)) {
     return;
   }
@@ -174,10 +196,10 @@ function removeFilesByExtension(dir, extension) {
   fs.readdirSync(dir, { withFileTypes: true }).forEach((entry) => {
     const entryPath = path.join(dir, entry.name);
     if (entry.isDirectory()) {
-      removeFilesByExtension(entryPath, extension);
+      removeFilesBySuffixes(entryPath, suffixes);
       return;
     }
-    if (entry.isFile() && entry.name.endsWith(extension)) {
+    if (entry.isFile() && suffixes.some((suffix) => entry.name.endsWith(suffix))) {
       fs.rmSync(entryPath, { force: true });
     }
   });
