@@ -8,10 +8,6 @@ const os = require("node:os");
 const path = require("node:path");
 const { execFileSync } = require("node:child_process");
 const { URL, fileURLToPath } = require("node:url");
-const chardet = require("chardet");
-const iconv = require("iconv-lite");
-const officeParser = require("officeparser");
-const WordExtractor = require("word-extractor");
 
 const DATA_DIR_KEY = "ai-chat/data-dir/v1";
 const DEFAULT_DATA_DIR = getDefaultDataDir();
@@ -69,6 +65,11 @@ try {
 
 let activeRequest = null;
 let activeSocket = null;
+let chardetModule = null;
+let iconvModule = null;
+let officeParserModule = null;
+let WordExtractorModule = null;
+let cachedConfig = null;
 const activeChatRequests = new Map();
 let lastEnterAction = null;
 let clipboardSnapshotText = "";
@@ -76,6 +77,7 @@ let clipboardChangedAt = 0;
 let clipboardSnapshotImage = null;
 let clipboardImageFingerprint = "";
 let clipboardImageChangedAt = 0;
+let clipboardImageBaselinePending = false;
 let clipboardWatcherTimer = null;
 let clipboardWatcherIntervalMs = 0;
 const enterListeners = new Set();
@@ -196,6 +198,10 @@ function dispatchOutAction(action) {
 }
 
 function getConfig() {
+  if (cachedConfig) {
+    return cachedConfig;
+  }
+
   const storage = getStorage();
   const dataDir = getStoredDataDir(storage);
   const stored = readConfigFile(dataDir);
@@ -204,6 +210,7 @@ function getConfig() {
   if (storage) {
     saveStoredDataDir(storage, normalized.dataDir);
   }
+  cachedConfig = normalized;
   return normalized;
 }
 
@@ -217,6 +224,7 @@ function saveConfig(config) {
   migrateDataDirectory(previous.dataDir, normalized.dataDir);
   writeConfigFile(normalized);
   saveStoredDataDir(storage, normalized.dataDir);
+  cachedConfig = normalized;
   startClipboardWatcher(normalized.clipboardPollingMs);
   return normalized;
 }
@@ -473,8 +481,36 @@ function getUser() {
   return null;
 }
 
+function getChardet() {
+  if (!chardetModule) {
+    chardetModule = require("chardet");
+  }
+  return chardetModule;
+}
+
+function getIconv() {
+  if (!iconvModule) {
+    iconvModule = require("iconv-lite");
+  }
+  return iconvModule;
+}
+
+function getOfficeParser() {
+  if (!officeParserModule) {
+    officeParserModule = require("officeparser");
+  }
+  return officeParserModule;
+}
+
+function getWordExtractor() {
+  if (!WordExtractorModule) {
+    WordExtractorModule = require("word-extractor");
+  }
+  return WordExtractorModule;
+}
+
 function getRecentClipboardText(maxAgeMs) {
-  updateClipboardSnapshot();
+  updateClipboardSnapshot({ readImage: false });
   const ageLimit = Number(maxAgeMs) || 0;
   if (!clipboardChangedAt || !ageLimit || Date.now() - clipboardChangedAt > ageLimit) {
     return "";
@@ -483,7 +519,7 @@ function getRecentClipboardText(maxAgeMs) {
 }
 
 function getRecentClipboardImage(maxAgeMs) {
-  updateClipboardSnapshot();
+  updateClipboardSnapshot({ readText: false });
   const ageLimit = Number(maxAgeMs) || 0;
   if (!clipboardImageChangedAt || !ageLimit || Date.now() - clipboardImageChangedAt > ageLimit) {
     return null;
@@ -623,24 +659,38 @@ function startClipboardWatcher(intervalMs) {
   }
   clipboardWatcherIntervalMs = nextIntervalMs;
   clipboardSnapshotText = safeReadClipboardText();
-  clipboardSnapshotImage = safeReadClipboardImage();
-  clipboardImageFingerprint = createClipboardImageFingerprint(clipboardSnapshotImage);
+  clipboardSnapshotImage = null;
+  clipboardImageFingerprint = "";
   clipboardImageChangedAt = 0;
+  clipboardImageBaselinePending = true;
   clipboardWatcherTimer = setInterval(updateClipboardSnapshot, nextIntervalMs);
 }
 
-function updateClipboardSnapshot() {
+function updateClipboardSnapshot(options) {
   if (!electronClipboard) {
     return;
   }
-  const value = safeReadClipboardText();
-  if (value !== clipboardSnapshotText) {
-    rememberClipboardText(value);
+  const settings = options || {};
+  if (settings.readText !== false) {
+    const value = safeReadClipboardText();
+    if (value !== clipboardSnapshotText) {
+      rememberClipboardText(value);
+    }
   }
-  const image = safeReadClipboardImage();
-  const imageFingerprint = createClipboardImageFingerprint(image);
-  if (imageFingerprint !== clipboardImageFingerprint) {
-    rememberClipboardImage(image, imageFingerprint);
+
+  if (settings.readImage !== false) {
+    const image = safeReadClipboardImage();
+    const imageFingerprint = createClipboardImageFingerprint(image);
+    if (clipboardImageBaselinePending) {
+      clipboardSnapshotImage = image;
+      clipboardImageFingerprint = imageFingerprint;
+      clipboardImageChangedAt = 0;
+      clipboardImageBaselinePending = false;
+      return;
+    }
+    if (imageFingerprint !== clipboardImageFingerprint) {
+      rememberClipboardImage(image, imageFingerprint);
+    }
   }
 }
 
@@ -889,6 +939,7 @@ function isDocumentLikePath(extension) {
 async function extractDocumentText(filePath, extension, config) {
   try {
     if (extension === "doc") {
+      const WordExtractor = getWordExtractor();
       const extractor = new WordExtractor();
       const extracted = await extractor.extract(filePath);
       return normalizeExtractedText(extracted.getBody());
@@ -896,6 +947,7 @@ async function extractDocumentText(filePath, extension, config) {
 
     const tempDir = getTempCacheDir(config);
     fs.mkdirSync(tempDir, { recursive: true });
+    const officeParser = getOfficeParser();
     const parseOffice = officeParser.parseOfficeAsync || officeParser.parseOffice;
     const text = await parseOffice(filePath, {
       tempFilesLocation: tempDir
@@ -919,7 +971,7 @@ function readTextFileWithAutoEncoding(filePath) {
 
   for (const encoding of encodings) {
     try {
-      const content = iconv.decode(data, encoding);
+      const content = getIconv().decode(data, encoding);
       if (!content.includes("\uFFFD")) {
         return normalizeExtractedText(content);
       }
@@ -928,12 +980,12 @@ function readTextFileWithAutoEncoding(filePath) {
     }
   }
 
-  return normalizeExtractedText(iconv.decode(data, "UTF-8"));
+  return normalizeExtractedText(getIconv().decode(data, "UTF-8"));
 }
 
 function detectFileEncoding(filePath) {
   try {
-    return chardet.detectFileSync(filePath, { sampleSize: ENCODING_SAMPLE_BYTES }) || "";
+    return getChardet().detectFileSync(filePath, { sampleSize: ENCODING_SAMPLE_BYTES }) || "";
   } catch (error) {
     return "";
   }
@@ -1048,12 +1100,13 @@ function readJsonFile(filePath) {
 function writeConfigFile(config) {
   const normalized = normalizeConfig(config);
   const dataDir = normalizeDataDir(normalized.dataDir);
+  const filePath = getConfigPath(dataDir);
+  const content = JSON.stringify(normalized, null, 2);
   ensureDataDirectory(dataDir);
-  fs.writeFileSync(
-    getConfigPath(dataDir),
-    JSON.stringify(normalized, null, 2),
-    "utf8"
-  );
+  if (fs.existsSync(filePath) && fs.readFileSync(filePath, "utf8") === content) {
+    return;
+  }
+  fs.writeFileSync(filePath, content, "utf8");
 }
 
 function writeChatStoreFile(config, store) {

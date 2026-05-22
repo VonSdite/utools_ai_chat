@@ -65,6 +65,10 @@
       proxyUrl: ""
     },
     userProfile: null,
+    chatStoreLoaded: false,
+    chatStoreLoadPromise: null,
+    taskStoreLoaded: false,
+    taskStoreLoadPromise: null,
     draftProviders: [],
     activeTab: "chat",
     activeTaskMode: "translate",
@@ -118,19 +122,12 @@
   async function init() {
     cacheElements();
     bindEvents();
-    await loadUserProfile();
-    await loadConfig();
-    await loadChatStore();
-    await loadTaskStore();
-    renderSettings();
-    renderChat();
-    renderTaskModelSelect();
-    renderSideTabs();
-    updateTaskInputPlaceholder();
-    updateTaskFileAccept();
-    renderActiveTaskState();
-    updateViewTitle();
-    renderChatSidebarState();
+    var initialAction = api.getLastEnterAction ? api.getLastEnterAction() : null;
+    var initialTab = initialAction ? tabFromEnterAction(initialAction) : "chat";
+    primeInitialTab(initialTab);
+
+    await Promise.all([loadUserProfile(), loadConfig()]);
+    await ensureStoreForTab(initialTab);
 
     if (api.onEnter) {
       api.onEnter(handlePluginEnter);
@@ -140,12 +137,14 @@
       api.onOut(handlePluginOut);
     }
 
-    if (api.getLastEnterAction) {
-      var lastAction = api.getLastEnterAction();
-      if (lastAction) {
-        handlePluginEnter(lastAction);
-      }
+    if (initialAction) {
+      await handlePluginEnter(initialAction);
+    } else {
+      setTab(initialTab);
+      refreshActiveView();
     }
+
+    loadDeferredStores();
   }
 
   function cacheElements() {
@@ -441,7 +440,7 @@
 
     els.sideTabs.forEach(function (tab) {
       tab.addEventListener("click", function () {
-        setTab(tab.dataset.tab);
+        openTab(tab.dataset.tab);
       });
     });
   }
@@ -473,6 +472,8 @@
     } catch (error) {
       state.chatStore = normalizeChatStore(null);
       showToast("读取会话失败：" + getErrorMessage(error));
+    } finally {
+      state.chatStoreLoaded = true;
     }
   }
 
@@ -482,7 +483,91 @@
     } catch (error) {
       state.taskStore = normalizeTaskStore(null);
       showToast("读取任务缓存失败：" + getErrorMessage(error));
+    } finally {
+      state.taskStoreLoaded = true;
     }
+  }
+
+  async function ensureChatStoreLoaded() {
+    if (state.chatStoreLoaded) {
+      return;
+    }
+    if (!state.chatStoreLoadPromise) {
+      state.chatStoreLoadPromise = loadChatStore().finally(function () {
+        state.chatStoreLoadPromise = null;
+      });
+    }
+    await state.chatStoreLoadPromise;
+  }
+
+  async function ensureTaskStoreLoaded() {
+    if (state.taskStoreLoaded) {
+      return;
+    }
+    if (!state.taskStoreLoadPromise) {
+      state.taskStoreLoadPromise = loadTaskStore().finally(function () {
+        state.taskStoreLoadPromise = null;
+      });
+    }
+    await state.taskStoreLoadPromise;
+  }
+
+  function ensureStoreForTab(tabName) {
+    if (TASKS[tabName]) {
+      return ensureTaskStoreLoaded();
+    }
+    if (tabName === "chat") {
+      return ensureChatStoreLoaded();
+    }
+    return Promise.resolve();
+  }
+
+  function loadDeferredStores() {
+    var schedule = window.requestIdleCallback || function (callback) {
+      return window.setTimeout(callback, 800);
+    };
+    schedule(function () {
+      if (!state.chatStoreLoaded) {
+        ensureChatStoreLoaded().then(function () {
+          if (state.activeTab === "chat") {
+            renderChat();
+          }
+        });
+      }
+      if (!state.taskStoreLoaded) {
+        ensureTaskStoreLoaded().then(function () {
+          if (state.activeTab === "task") {
+            renderActiveTaskState();
+          }
+        });
+      }
+    });
+  }
+
+  function primeInitialTab(tabName) {
+    var nextTab = tabName;
+    if (TASKS[tabName]) {
+      state.activeTaskMode = tabName;
+      nextTab = "task";
+    }
+    if (nextTab !== "task" && nextTab !== "chat" && nextTab !== "settings") {
+      nextTab = "chat";
+    }
+    state.activeTab = nextTab;
+    renderSideTabs();
+    els.taskView.classList.toggle("is-active", state.activeTab === "task");
+    els.chatView.classList.toggle("is-active", state.activeTab === "chat");
+    els.settingsView.classList.toggle("is-active", state.activeTab === "settings");
+    updateTaskInputPlaceholder();
+    updateTaskFileAccept();
+    updateViewTitle();
+    renderChatSidebarState();
+  }
+
+  async function openTab(tabName) {
+    await ensureStoreForTab(tabName);
+    setTab(tabName);
+    refreshActiveView();
   }
 
   async function handlePluginEnter(action) {
@@ -494,6 +579,7 @@
     }
 
     var tab = tabFromEnterAction(action);
+    await ensureStoreForTab(tab);
     setTab(tab);
     refreshActiveView();
 
@@ -688,9 +774,15 @@
   async function getEnterPayload(action, tab) {
     var selectedText = action.type === "over" ? extractPayloadText(action.payload) : "";
     var selectedImages = action.type === "img" ? await readActionImages(action.payload) : [];
-    var images = selectedImages.length ? selectedImages : (selectedText ? [] : await readRecentClipboardImages());
+    var text = selectedText || (await readRecentClipboardText());
+    var shouldReadClipboardImages = tab === "ocr" || !text;
+    var images = selectedImages.length
+      ? selectedImages
+      : shouldReadClipboardImages
+        ? await readRecentClipboardImages()
+        : [];
     return {
-      text: selectedText || (await readRecentClipboardText()),
+      text: text,
       images: images
     };
   }
@@ -1554,6 +1646,7 @@
       return;
     }
 
+    await ensureChatStoreLoaded();
     ensureActiveAssistantAndSession();
     var assistant = getActiveAssistant();
     if (!assistant) {
@@ -4555,6 +4648,9 @@
 
   async function saveChatStoreQuietly(options) {
     var settings = options || {};
+    if (!state.chatStoreLoaded) {
+      return;
+    }
     invalidateChatSearchIndex();
     try {
       if (api.saveChatStore) {
@@ -4570,6 +4666,9 @@
 
   function saveTaskStoreQuietly(options) {
     var settings = Object.assign({ immediate: false, showError: false }, options || {});
+    if (!state.taskStoreLoaded) {
+      return Promise.resolve();
+    }
     var saveToken = state.taskSaveToken + 1;
     state.taskSaveToken = saveToken;
     window.clearTimeout(state.taskSaveTimer);
