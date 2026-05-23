@@ -15,6 +15,9 @@
   var SEARCH_DEBOUNCE_MS = 120;
   var MAX_CHAT_RUNS = 3;
   var INTERNAL_IMAGE_PASTE_ENTER_WINDOW_MS = 1500;
+  var INTERNAL_CLIPBOARD_COPY_IGNORE_MS = 5000;
+  var PLUGIN_ENTER_CLIPBOARD_IGNORE_MS = 1200;
+  var TASK_RUNNING_INPUT_PREVIEW_MAX = 36;
   var TASKS = {
     translate: { title: "翻译", action: "翻译", placeholder: "把小纸条放这里，我来认真读" },
     summary: { title: "总结", action: "总结", placeholder: "把长长的内容放这里，我来帮你收成重点" },
@@ -80,7 +83,7 @@
     chatStore: { assistants: [], activeAssistantId: "" },
     assistantsOpen: false,
     currentResult: "",
-    running: false,
+    taskRuns: {},
     chatRuns: {},
     chatSidebarCollapsed: true,
     fetchingModelsProviderId: "",
@@ -111,9 +114,11 @@
     selectionSpeechTimer: 0,
     reasoningToggleAt: 0,
     reasoningToggleMessageId: "",
-    taskRunId: "",
-    runningTaskMode: "",
     internalImagePasteAt: 0,
+    internalClipboardCopyAt: 0,
+    internalClipboardCopyText: "",
+    superPanelEnterAt: 0,
+    superPanelEnterFingerprint: "",
     toastTimer: 0
   };
 
@@ -138,6 +143,10 @@
 
     if (api.onOut) {
       api.onOut(handlePluginOut);
+    }
+
+    if (api.onClipboardChange) {
+      api.onClipboardChange(handleClipboardChange);
     }
 
     if (initialAction) {
@@ -260,7 +269,6 @@
       handleSubmitKeydown(event, startTask);
     });
     els.inputText.addEventListener("input", function () {
-      invalidateActiveTaskResultForInputChange();
       syncActiveTaskFromInput();
       updateContinueChatButton();
       hideSelectionSpeechButton();
@@ -447,6 +455,7 @@
     document.addEventListener("selectionchange", scheduleSelectionSpeechButtonUpdate);
     document.addEventListener("mousedown", handleDocumentMouseDownForSelectionSpeech);
     document.addEventListener("paste", markInternalImagePaste, true);
+    document.addEventListener("copy", markInternalClipboardCopy, true);
     window.addEventListener("resize", hideSelectionSpeechButton);
 
     els.sideTabs.forEach(function (tab) {
@@ -594,8 +603,12 @@
     if (shouldIgnoreInternalImagePasteEnter(action)) {
       return;
     }
+    var intent = resolveEnterActionIntent(action);
+    if (intent.fromSuperPanel) {
+      markSuperPanelEnter();
+    }
 
-    var tab = tabFromEnterAction(action);
+    var tab = intent.tab;
     await ensureStoreForTab(tab);
     setTab(tab);
     refreshActiveView();
@@ -604,37 +617,24 @@
       return;
     }
 
-    var payload = await getEnterPayload(action, tab);
+    var payload = await resolveEnterActionPayload(intent);
+    if (intent.fromSuperPanel) {
+      markSuperPanelEnter(payload);
+    }
     if (tab === "chat") {
-      if (payload.text) {
-        els.chatInput.value = payload.text;
-      }
-      if (payload.images.length) {
-        addPreparedAttachments("chat", payload.images);
-      }
+      applyExternalPayloadToChat(payload);
       window.setTimeout(function () {
         els.chatInput.focus();
       }, 0);
       return;
     }
 
-    if (payload.text || payload.images.length) {
-      state.taskAttachments = [];
-      state.currentResult = "";
-      els.inputText.value = "";
-      getActiveTaskState().cancelled = false;
-      renderAttachments("task");
-      renderTaskPlaceholder(EMPTY_RESULT_PLACEHOLDER);
-      els.copyTaskBtn.disabled = true;
-      syncActiveTaskFromInput();
+    var taskModeRunning = isTaskModeRunning(state.activeTaskMode);
+    var appliedPayload = applyExternalPayloadToTask(payload);
+    if (taskModeRunning && appliedPayload.hasPayload) {
+      showToast(createTaskRunningToast(state.activeTaskMode, getTaskRun(state.activeTaskMode)));
     }
-
-    if (payload.text) {
-      els.inputText.value = payload.text;
-      syncActiveTaskFromInput();
-    }
-    var addedImages = payload.images.length ? addPreparedAttachments("task", payload.images) : 0;
-    if (addedImages || (payload.text && tab !== "ocr")) {
+    if (!taskModeRunning && (appliedPayload.addedImages || (appliedPayload.text && tab !== "ocr"))) {
       startTask();
       return;
     }
@@ -652,11 +652,177 @@
     saveChatStoreQuietly();
 
     if (action && action.isKill) {
-      if (state.running) {
-        stopActiveRequest({ showToast: false });
-      }
+      abortAllTaskRuns({ showToast: false });
       abortAllChatRuns({ showToast: false });
     }
+  }
+
+  async function handleClipboardChange(event) {
+    if (!shouldApplyClipboardChange(event)) {
+      return;
+    }
+
+    if (state.activeTab === "chat") {
+      applyClipboardToChat(event);
+      return;
+    }
+
+    if (state.activeTab === "task") {
+      applyClipboardToTask(event);
+    }
+  }
+
+  function shouldApplyClipboardChange(event) {
+    if (!event || state.activeTab === "settings") {
+      return false;
+    }
+    if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+      return false;
+    }
+    if (isInternalClipboardCopy(event)) {
+      return false;
+    }
+    if (isRecentSuperPanelClipboardEvent(event)) {
+      return false;
+    }
+    return Boolean(String(event.text || "").trim() || (event.images && event.images.length));
+  }
+
+  function isInternalClipboardCopy(event) {
+    if (!state.internalClipboardCopyAt) {
+      return false;
+    }
+    if (Date.now() - state.internalClipboardCopyAt > INTERNAL_CLIPBOARD_COPY_IGNORE_MS) {
+      state.internalClipboardCopyAt = 0;
+      state.internalClipboardCopyText = "";
+      return false;
+    }
+    var text = String(event && event.text || "").trim();
+    if (!text || !state.internalClipboardCopyText) {
+      return true;
+    }
+    return text === state.internalClipboardCopyText;
+  }
+
+  function isSuperPanelEnterSource(action, type) {
+    var from = String(action && action.from || "").toLowerCase();
+    return from === "panel" || from === "superpanel" || type === "over" || isImageEnterType(type);
+  }
+
+  function getEnterActionType(action) {
+    return String(action && action.type || "").toLowerCase();
+  }
+
+  function isImageEnterType(type) {
+    return type === "img" || type === "image";
+  }
+
+  function markSuperPanelEnter(payload) {
+    state.superPanelEnterAt = Date.now();
+    state.superPanelEnterFingerprint = payload ? createClipboardPayloadFingerprint(payload) : "";
+  }
+
+  function isRecentSuperPanelClipboardEvent(event) {
+    if (!state.superPanelEnterAt) {
+      return false;
+    }
+    if (Date.now() - state.superPanelEnterAt > PLUGIN_ENTER_CLIPBOARD_IGNORE_MS) {
+      state.superPanelEnterAt = 0;
+      state.superPanelEnterFingerprint = "";
+      return false;
+    }
+    if (!state.superPanelEnterFingerprint) {
+      return true;
+    }
+    return createClipboardPayloadFingerprint(event) === state.superPanelEnterFingerprint;
+  }
+
+  function createClipboardPayloadFingerprint(payload) {
+    var text = String(payload && payload.text || "").trim();
+    var images = normalizePreparedAttachments(payload && payload.images || []);
+    return text + "|" + images.map(createAttachmentFingerprint).join(",");
+  }
+
+  function createAttachmentFingerprint(attachment) {
+    if (!attachment) {
+      return "";
+    }
+    var dataUrl = String(attachment.dataUrl || "");
+    if (dataUrl) {
+      return [
+        "data",
+        dataUrl.length,
+        dataUrl.slice(0, 48),
+        dataUrl.slice(-48)
+      ].join(":");
+    }
+    return [
+      attachment.id || "",
+      attachment.name || "",
+      attachment.size || "",
+      attachment.width || "",
+      attachment.height || ""
+    ].join(":");
+  }
+
+  function applyClipboardToChat(event) {
+    applyExternalPayloadToChat(event);
+  }
+
+  function applyClipboardToTask(event) {
+    var activeRun = getTaskRun(state.activeTaskMode);
+    var appliedPayload = applyExternalPayloadToTask(event, { immediate: true });
+    if (activeRun) {
+      if (appliedPayload.hasPayload) {
+        showToast(createTaskRunningToast(state.activeTaskMode, activeRun));
+      }
+      return;
+    }
+    if (appliedPayload.addedImages || (appliedPayload.text && state.activeTaskMode !== "ocr")) {
+      startTask();
+    }
+  }
+
+  function applyExternalPayloadToChat(payload) {
+    var appliedPayload = prepareExternalPayload("chat", payload);
+    if (!appliedPayload.hasPayload || !appliedPayload.canApply) {
+      return appliedPayload;
+    }
+    els.chatInput.value = appliedPayload.text;
+    state.chatAttachments = appliedPayload.images.length ? appliedPayload.preparedImages : [];
+    renderAttachments("chat");
+    updateChatSlashMenu();
+    hideSelectionSpeechButton();
+    return appliedPayload;
+  }
+
+  function applyExternalPayloadToTask(payload, options) {
+    var appliedPayload = prepareExternalPayload("task", payload);
+    if (!appliedPayload.hasPayload || !appliedPayload.canApply) {
+      return appliedPayload;
+    }
+    els.inputText.value = appliedPayload.text;
+    state.taskAttachments = appliedPayload.images.length ? appliedPayload.preparedImages : [];
+    renderAttachments("task");
+    syncActiveTaskFromInput({ immediate: Boolean(options && options.immediate) });
+    updateContinueChatButton();
+    hideSelectionSpeechButton();
+    return appliedPayload;
+  }
+
+  function prepareExternalPayload(target, payload) {
+    var text = String(payload && payload.text || "").trim();
+    var images = normalizePreparedAttachments(payload && payload.images || []);
+    var preparedImages = images.length ? getPreparedAttachmentsForTarget(target, images, []) : [];
+    var canApply = Boolean(text || !images.length || preparedImages.length);
+    return {
+      text: text,
+      images: images,
+      preparedImages: preparedImages,
+      addedImages: preparedImages.length,
+      hasPayload: Boolean(text || images.length),
+      canApply: canApply
+    };
   }
 
   function refreshActiveView() {
@@ -674,17 +840,36 @@
   }
 
   function tabFromEnterAction(action) {
-    var commandTab = action && action.type !== "over"
-      ? tabFromCommandText(extractActionCommandText(action))
+    return resolveEnterActionIntent(action).tab;
+  }
+
+  function resolveEnterActionIntent(action) {
+    var type = getEnterActionType(action);
+    var fromSuperPanel = isSuperPanelEnterSource(action, type);
+    return {
+      action: action,
+      type: type,
+      fromSuperPanel: fromSuperPanel,
+      tab: resolveEnterActionTab(action, fromSuperPanel)
+    };
+  }
+
+  function resolveEnterActionTab(action, fromSuperPanel) {
+    var codeTab = tabFromActionCode(action && action.code);
+    if (codeTab) {
+      return codeTab;
+    }
+    var commandTab = action
+      ? tabFromCommandText(extractActionCommandText(action, { includePayload: !fromSuperPanel }))
       : "";
     if (commandTab) {
       return commandTab;
     }
-    return tabFromActionCode(action && action.code) || "translate";
+    return "translate";
   }
 
   function shouldIgnoreInternalImagePasteEnter(action) {
-    if (!action || action.type !== "img") {
+    if (!action || !isImageEnterType(getEnterActionType(action))) {
       return false;
     }
     return Date.now() - state.internalImagePasteAt <= INTERNAL_IMAGE_PASTE_ENTER_WINDOW_MS;
@@ -717,14 +902,15 @@
     return "";
   }
 
-  function extractActionCommandText(action) {
+  function extractActionCommandText(action, options) {
+    var settings = options || {};
     var values = [
       action && action.keyword,
       action && action.cmd,
       action && action.name,
       action && action.label,
       extractOptionText(action && action.option),
-      extractPayloadText(action && action.payload)
+      settings.includePayload ? extractPayloadText(action && action.payload) : ""
     ];
     for (var index = 0; index < values.length; index += 1) {
       var value = String(values[index] || "").trim();
@@ -774,24 +960,57 @@
 
   function extractPayloadText(payload) {
     if (typeof payload === "string") {
+      if (/^data:image\//i.test(payload.trim())) {
+        return "";
+      }
       return payload.trim();
     }
-    if (payload && typeof payload === "object") {
-      if (typeof payload.text === "string") {
-        return payload.text.trim();
+    if (Array.isArray(payload)) {
+      for (var arrayIndex = 0; arrayIndex < payload.length; arrayIndex += 1) {
+        var arrayText = extractPayloadText(payload[arrayIndex]);
+        if (arrayText) {
+          return arrayText;
+        }
       }
-      if (typeof payload.value === "string") {
-        return payload.value.trim();
+      return "";
+    }
+    if (payload && typeof payload === "object") {
+      var keys = [
+        "text",
+        "value",
+        "content",
+        "selection",
+        "selectedText",
+        "selected",
+        "query",
+        "data"
+      ];
+      for (var index = 0; index < keys.length; index += 1) {
+        if (payload[keys[index]] !== undefined) {
+          return extractPayloadText(payload[keys[index]]);
+        }
+      }
+      if (payload.payload !== undefined) {
+        return extractPayloadText(payload.payload);
+      }
+      if (Array.isArray(payload.items)) {
+        for (var itemIndex = 0; itemIndex < payload.items.length; itemIndex += 1) {
+          var itemText = extractPayloadText(payload.items[itemIndex]);
+          if (itemText) {
+            return itemText;
+          }
+        }
       }
     }
     return "";
   }
 
-  async function getEnterPayload(action, tab) {
-    var selectedText = action.type === "over" ? extractPayloadText(action.payload) : "";
-    var selectedImages = action.type === "img" ? await readActionImages(action.payload) : [];
+  async function resolveEnterActionPayload(intent) {
+    var action = intent.action;
+    var selectedImages = shouldReadActionPayloadImages(intent) ? await readActionImages(action && action.payload) : [];
+    var selectedText = shouldReadActionPayloadText(intent, selectedImages) ? extractPayloadText(action && action.payload) : "";
     var text = selectedText || (await readRecentClipboardText());
-    var shouldReadClipboardImages = tab === "ocr" || !text;
+    var shouldReadClipboardImages = intent.tab === "ocr" || !text;
     var images = selectedImages.length
       ? selectedImages
       : shouldReadClipboardImages
@@ -801,6 +1020,69 @@
       text: text,
       images: images
     };
+  }
+
+  function shouldReadActionPayloadText(intent, selectedImages) {
+    if (selectedImages && selectedImages.length) {
+      return false;
+    }
+    if (intent.type === "over") {
+      return true;
+    }
+    if (isImageEnterType(intent.type)) {
+      return false;
+    }
+    return intent.fromSuperPanel;
+  }
+
+  function shouldReadActionPayloadImages(intent) {
+    return isImageEnterType(intent.type) || actionPayloadLooksLikeImage(intent.action && intent.action.payload);
+  }
+
+  function actionPayloadLooksLikeImage(payload) {
+    if (!payload) {
+      return false;
+    }
+    if (typeof payload === "string") {
+      return isImagePayloadString(payload);
+    }
+    if (Array.isArray(payload)) {
+      return payload.some(actionPayloadLooksLikeImage);
+    }
+    if (typeof payload === "object") {
+      if (String(payload.kind || "").toLowerCase() === "image") {
+        return true;
+      }
+      if (/^image\//i.test(String(payload.mime || payload.type || ""))) {
+        return true;
+      }
+      var imageKeys = [
+        "dataUrl",
+        "dataURL",
+        "url",
+        "path",
+        "filePath",
+        "file",
+        "images",
+        "items",
+        "files",
+        "list",
+        "paths",
+        "filePaths",
+        "payload"
+      ];
+      for (var index = 0; index < imageKeys.length; index += 1) {
+        if (actionPayloadLooksLikeImage(payload[imageKeys[index]])) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  function isImagePayloadString(value) {
+    var text = String(value || "").trim();
+    return /^data:image\//i.test(text) || /\.(png|jpe?g|webp|gif|bmp)(?:[?#].*)?$/i.test(text);
   }
 
   async function readRecentClipboardText() {
@@ -954,8 +1236,85 @@
     return getTaskState(state.activeTaskMode);
   }
 
+  function ensureTaskResultSource(taskState) {
+    if (!taskState || !taskState.result) {
+      return;
+    }
+    if (taskState.resultSourceCaptured) {
+      return;
+    }
+    taskState.resultInputText = taskState.inputText || "";
+    taskState.resultAttachments = cloneAttachments(taskState.attachments);
+    taskState.resultSourceCaptured = true;
+  }
+
+  function getTaskRun(mode) {
+    var taskMode = TASKS[mode] ? mode : state.activeTaskMode;
+    return (state.taskRuns && state.taskRuns[taskMode]) || null;
+  }
+
+  function isTaskModeRunning(mode) {
+    return Boolean(getTaskRun(mode));
+  }
+
+  function setTaskRun(mode, run) {
+    if (!state.taskRuns) {
+      state.taskRuns = {};
+    }
+    state.taskRuns[mode] = run;
+  }
+
+  function clearTaskRun(mode, requestId) {
+    var run = getTaskRun(mode);
+    if (!run || (requestId && run.requestId !== requestId)) {
+      return;
+    }
+    delete state.taskRuns[mode];
+  }
+
+  function renderTaskRunControls() {
+    var activeRunning = isTaskModeRunning(state.activeTaskMode);
+    els.sendTaskBtn.disabled = activeRunning;
+    els.stopTaskBtn.disabled = !activeRunning;
+  }
+
+  function createTaskRunningToast(mode, run) {
+    var preview = truncateTaskInputPreview(run && run.inputPreview);
+    if (!preview) {
+      return (TASKS[mode] ? TASKS[mode].title : "任务") + "正在输出中";
+    }
+    return "正在执行「" + preview + "」的输入";
+  }
+
+  function createTaskInputPreview(text, attachments) {
+    var value = normalizeTaskInputPreview(text);
+    if (value) {
+      return truncateTaskInputPreview(value);
+    }
+    value = (attachments || [])
+      .map(function (attachment) {
+        return attachment && attachment.name ? attachment.name : "";
+      })
+      .filter(Boolean)
+      .join("、");
+    return truncateTaskInputPreview(value || "附件");
+  }
+
+  function normalizeTaskInputPreview(value) {
+    return String(value || "").replace(/\s+/g, " ").trim();
+  }
+
+  function truncateTaskInputPreview(value) {
+    var text = normalizeTaskInputPreview(value);
+    if (text.length <= TASK_RUNNING_INPUT_PREVIEW_MAX) {
+      return text;
+    }
+    return text.slice(0, TASK_RUNNING_INPUT_PREVIEW_MAX) + "...";
+  }
+
   function renderActiveTaskState() {
     var taskState = getActiveTaskState();
+    ensureTaskResultSource(taskState);
     state.taskAttachments = cloneAttachments(taskState.attachments);
     state.currentResult = taskState.result || "";
     els.inputText.value = taskState.inputText || "";
@@ -963,12 +1322,11 @@
     if (state.currentResult || taskState.cancelled) {
       renderTaskResult(state.currentResult, taskState.cancelled);
     } else {
-      var processing = state.running && state.runningTaskMode === state.activeTaskMode;
+      var processing = isTaskModeRunning(state.activeTaskMode);
       renderTaskPlaceholder(processing ? PROCESSING_PLACEHOLDER : EMPTY_RESULT_PLACEHOLDER, processing);
     }
     els.copyTaskBtn.disabled = !state.currentResult;
-    els.sendTaskBtn.disabled = state.running;
-    els.stopTaskBtn.disabled = !state.running;
+    renderTaskRunControls();
     updateContinueChatButton();
   }
 
@@ -981,7 +1339,7 @@
     saveTaskStoreQuietly(options);
   }
 
-  function syncTaskResult(mode, result, render) {
+  function syncTaskResult(mode, result, render, options) {
     var taskState = getTaskState(mode);
     taskState.result = result || "";
     taskState.updatedAt = Date.now();
@@ -989,10 +1347,10 @@
       state.currentResult = taskState.result;
       if (render) {
         if (state.currentResult) {
-          renderTaskResult(state.currentResult, taskState.cancelled);
+          renderTaskResult(state.currentResult, taskState.cancelled, options);
         } else {
           if (taskState.cancelled) {
-            renderTaskResult("", true);
+            renderTaskResult("", true, options);
           } else {
             renderTaskPlaceholder(EMPTY_RESULT_PLACEHOLDER);
           }
@@ -1006,7 +1364,9 @@
 
   function appendTaskResult(mode, text) {
     var taskState = getTaskState(mode);
-    syncTaskResult(mode, (taskState.result || "") + (text || ""), true);
+    syncTaskResult(mode, (taskState.result || "") + (text || ""), true, {
+      preserveScroll: mode === state.activeTaskMode
+    });
   }
 
   function markTaskCancelled(mode, options) {
@@ -1015,7 +1375,7 @@
     taskState.updatedAt = Date.now();
     if (mode === state.activeTaskMode) {
       state.currentResult = taskState.result || "";
-      renderTaskResult(state.currentResult, true);
+      renderTaskResult(state.currentResult, true, { preserveScroll: true });
       els.copyTaskBtn.disabled = !state.currentResult;
       updateContinueChatButton();
     }
@@ -1032,6 +1392,12 @@
     var provider = getActiveProvider();
     var mode = state.activeTaskMode;
     var attachments = cloneAttachments(taskState.attachments);
+
+    var runningRun = getTaskRun(mode);
+    if (runningRun) {
+      showToast(createTaskRunningToast(mode, runningRun));
+      return;
+    }
 
     if (!text && !attachments.length) {
       showToast("先输入一点内容");
@@ -1054,16 +1420,21 @@
       return;
     }
 
-    state.running = true;
-    state.runningTaskMode = mode;
     var runId = createId("task-run");
-    state.taskRunId = runId;
+    var run = {
+      requestId: runId,
+      mode: mode,
+      inputPreview: createTaskInputPreview(text, attachments)
+    };
+    setTaskRun(mode, run);
     state.currentResult = "";
-    getTaskState(mode).cancelled = false;
+    taskState.resultInputText = text;
+    taskState.resultAttachments = cloneAttachments(attachments);
+    taskState.resultSourceCaptured = true;
+    taskState.cancelled = false;
     syncTaskResult(mode, "", false);
     renderTaskPlaceholder(PROCESSING_PLACEHOLDER, true);
-    els.sendTaskBtn.disabled = true;
-    els.stopTaskBtn.disabled = false;
+    renderTaskRunControls();
     els.copyTaskBtn.disabled = true;
     updateContinueChatButton();
 
@@ -1071,6 +1442,7 @@
     try {
       await api.runTask(
         {
+          requestId: runId,
           mode: mode,
           text: text,
           providerId: provider.id,
@@ -1095,11 +1467,8 @@
       if (!isCurrentTaskRun(runId, mode)) {
         return;
       }
-      state.running = false;
-      state.runningTaskMode = "";
-      state.taskRunId = "";
-      els.sendTaskBtn.disabled = false;
-      els.stopTaskBtn.disabled = true;
+      clearTaskRun(mode, runId);
+      renderTaskRunControls();
       if (mode === state.activeTaskMode) {
         els.copyTaskBtn.disabled = !state.currentResult;
       }
@@ -1109,7 +1478,8 @@
   }
 
   function isCurrentTaskRun(runId, mode) {
-    return Boolean(runId && state.taskRunId === runId && state.runningTaskMode === mode);
+    var run = getTaskRun(mode);
+    return Boolean(runId && run && run.requestId === runId);
   }
 
   function handleTaskEvent(event, provider, mode) {
@@ -1123,9 +1493,6 @@
 
     if (event.type === "delta") {
       appendTaskResult(mode, event.text || "");
-      if (mode === state.activeTaskMode) {
-        els.resultText.scrollTop = els.resultText.scrollHeight;
-      }
       return;
     }
 
@@ -1158,19 +1525,29 @@
 
   function stopActiveRequest(options) {
     var settings = Object.assign({ showToast: true }, options || {});
-    var mode = state.runningTaskMode || state.activeTaskMode;
-    state.running = false;
-    state.runningTaskMode = "";
-    state.taskRunId = "";
+    var mode = settings.mode || state.activeTaskMode;
+    var run = getTaskRun(mode);
+    if (!run) {
+      renderTaskRunControls();
+      return;
+    }
+    clearTaskRun(mode, run.requestId);
     markTaskCancelled(mode, { showToast: settings.showToast });
-    if (api.abortActive) {
+    if (api.abortTask) {
+      api.abortTask(run.requestId);
+    } else if (api.abortActive) {
       api.abortActive();
     }
-    els.sendTaskBtn.disabled = false;
-    els.stopTaskBtn.disabled = true;
+    renderTaskRunControls();
     renderChatRunControls();
     updateContinueChatButton();
     saveTaskStoreQuietly({ immediate: true });
+  }
+
+  function abortAllTaskRuns(options) {
+    Object.keys(state.taskRuns || {}).forEach(function (mode) {
+      stopActiveRequest(Object.assign({}, options || {}, { mode: mode }));
+    });
   }
 
   function stopActiveChatRequest() {
@@ -1184,13 +1561,20 @@
   }
 
   function clearTask() {
-    if (state.running && state.runningTaskMode === state.activeTaskMode) {
-      stopActiveRequest();
+    var activeRun = getTaskRun(state.activeTaskMode);
+    if (activeRun) {
+      stopActiveRequest({ showToast: false, mode: state.activeTaskMode });
     }
+    var taskState = getActiveTaskState();
     els.inputText.value = "";
     state.taskAttachments = [];
     state.currentResult = "";
-    getActiveTaskState().cancelled = false;
+    taskState.result = "";
+    taskState.resultInputText = "";
+    taskState.resultAttachments = [];
+    taskState.resultSourceCaptured = false;
+    taskState.cancelled = false;
+    taskState.updatedAt = Date.now();
     syncActiveTaskFromInput({ immediate: true });
     hideSelectionSpeechButton();
     renderTaskPlaceholder(EMPTY_RESULT_PLACEHOLDER);
@@ -1206,6 +1590,7 @@
     }
 
     try {
+      markProgrammaticClipboardCopy(state.currentResult);
       if (api.copyText) {
         await api.copyText(state.currentResult);
       } else if (navigator.clipboard) {
@@ -1626,7 +2011,11 @@
       .trim();
   }
 
-  function renderTaskResult(text, cancelled) {
+  function renderTaskResult(text, cancelled, options) {
+    var settings = options || {};
+    var preserveScroll = settings.preserveScroll === true;
+    var shouldStickToBottom = preserveScroll && isTaskResultNearBottom();
+    var previousScrollTop = els.resultText.scrollTop;
     hideSelectionSpeechButton();
     els.resultText.classList.remove("is-placeholder", "is-processing");
     var hasText = Boolean(String(text || "").trim());
@@ -1636,6 +2025,24 @@
       : cancelled
         ? renderTaskCancelStatus()
         : "";
+    if (preserveScroll) {
+      if (shouldStickToBottom) {
+        scrollTaskResultToBottom();
+      } else {
+        els.resultText.scrollTop = previousScrollTop;
+      }
+    }
+  }
+
+  function isTaskResultNearBottom() {
+    if (!els.resultText) {
+      return true;
+    }
+    return els.resultText.scrollHeight - els.resultText.scrollTop - els.resultText.clientHeight <= 32;
+  }
+
+  function scrollTaskResultToBottom() {
+    els.resultText.scrollTop = els.resultText.scrollHeight;
   }
 
   function renderTaskPlaceholder(text, processing) {
@@ -1653,18 +2060,18 @@
   }
 
   function updateContinueChatButton() {
-    var hasInput = Boolean(els.inputText.value.trim() || state.taskAttachments.length);
-    var activeRunning = state.running && state.runningTaskMode === state.activeTaskMode;
-    els.continueChatBtn.hidden = activeRunning || !state.currentResult || !hasInput;
+    var activeRunning = isTaskModeRunning(state.activeTaskMode);
+    els.continueChatBtn.hidden = activeRunning || !state.currentResult;
   }
 
   async function continueTaskInChat() {
-    var text = els.inputText.value.trim();
+    var taskState = getActiveTaskState();
+    var text = getTaskContinuationText(taskState);
     var result = state.currentResult.trim();
-    var attachments = cloneAttachmentsForRequest(state.taskAttachments);
+    var attachments = getTaskContinuationAttachments(taskState);
     var provider = getActiveProvider();
 
-    if (!result || (!text && !attachments.length)) {
+    if (!result) {
       updateContinueChatButton();
       return;
     }
@@ -1680,18 +2087,23 @@
     var session = getReusableContinuationSession(assistant);
     session.providerId = provider ? provider.id : session.providerId;
     session.modelId = provider ? provider.modelId : session.modelId;
-    session.title = createSessionTitle(text, attachments);
-    session.messages = [
-      createMessage("user", text, sanitizeAttachmentsForStorage(attachments)),
-      applyMessageModelMeta(createMessage("assistant", result, []), provider)
-    ];
+    session.title = createTaskContinuationTitle(text, attachments);
+    session.messages = [];
+    if (text || attachments.length) {
+      session.messages.push(createMessage("user", text, sanitizeAttachmentsForStorage(attachments)));
+    }
+    session.messages.push(applyMessageModelMeta(createMessage("assistant", result, []), provider));
     session.updatedAt = Date.now();
     assistant.activeSessionId = session.id;
 
     state.taskAttachments = [];
     state.currentResult = "";
     els.inputText.value = "";
-    getActiveTaskState().cancelled = false;
+    taskState.result = "";
+    taskState.resultInputText = "";
+    taskState.resultAttachments = [];
+    taskState.resultSourceCaptured = false;
+    taskState.cancelled = false;
     syncActiveTaskFromInput({ immediate: true });
     renderAttachments("task");
     renderTaskPlaceholder(EMPTY_RESULT_PLACEHOLDER);
@@ -1703,6 +2115,30 @@
     window.setTimeout(function () {
       els.chatInput.focus();
     }, 0);
+  }
+
+  function getTaskContinuationText(taskState) {
+    if (taskState && taskState.resultSourceCaptured) {
+      return String(taskState.resultInputText || "").trim();
+    }
+    var sourceText = taskState && typeof taskState.resultInputText === "string"
+      ? taskState.resultInputText
+      : "";
+    return (sourceText || els.inputText.value || "").trim();
+  }
+
+  function getTaskContinuationAttachments(taskState) {
+    var sourceAttachments = taskState && taskState.resultSourceCaptured
+      ? taskState.resultAttachments
+      : state.taskAttachments;
+    return cloneAttachmentsForRequest(sourceAttachments);
+  }
+
+  function createTaskContinuationTitle(text, attachments) {
+    if (text || attachments.length) {
+      return createSessionTitle(text, attachments);
+    }
+    return (TASKS[state.activeTaskMode] ? TASKS[state.activeTaskMode].title : "任务") + "输出";
   }
 
   function getReusableContinuationSession(assistant) {
@@ -2172,14 +2608,20 @@
   }
 
   function addPreparedAttachments(target, attachments) {
+    var existingAttachments = target === "chat" ? state.chatAttachments : state.taskAttachments;
+    var nextAttachments = getPreparedAttachmentsForTarget(target, attachments, existingAttachments);
+    appendAttachments(target, nextAttachments);
+    return nextAttachments.length;
+  }
+
+  function getPreparedAttachmentsForTarget(target, attachments, existingAttachments) {
     var prepared = (attachments || []).map(normalizePreparedAttachment).filter(Boolean);
     if (!prepared.length) {
-      return 0;
+      return [];
     }
 
     var provider = target === "chat" ? getChatProvider(getActiveAssistant()) : getActiveProvider();
-    var existingAttachments = target === "chat" ? state.chatAttachments : state.taskAttachments;
-    var attachmentSlots = getRemainingAttachmentSlots(existingAttachments);
+    var attachmentSlots = getRemainingAttachmentSlots(existingAttachments || []);
     var nextAttachments = [];
 
     prepared.forEach(function (attachment) {
@@ -2203,8 +2645,7 @@
       attachmentSlots -= 1;
     });
 
-    appendAttachments(target, nextAttachments);
-    return nextAttachments.length;
+    return nextAttachments;
   }
 
   function normalizePreparedAttachment(attachment) {
@@ -2244,38 +2685,9 @@
     }
 
     state.taskAttachments = state.taskAttachments.concat(nextAttachments);
-    invalidateActiveTaskResultForInputChange();
     renderAttachments("task");
     updateContinueChatButton();
     syncActiveTaskFromInput({ immediate: true });
-  }
-
-  function invalidateActiveTaskResultForInputChange() {
-    var activeRunning = state.running && state.runningTaskMode === state.activeTaskMode;
-    var taskState = getActiveTaskState();
-
-    if (!activeRunning && !state.currentResult && !taskState.cancelled) {
-      return;
-    }
-
-    if (activeRunning) {
-      state.running = false;
-      state.runningTaskMode = "";
-      state.taskRunId = "";
-      if (api.abortActive) {
-        api.abortActive();
-      }
-      els.sendTaskBtn.disabled = false;
-      els.stopTaskBtn.disabled = true;
-    }
-
-    stopTaskSpeech();
-    state.currentResult = "";
-    taskState.result = "";
-    taskState.cancelled = false;
-    renderTaskPlaceholder(EMPTY_RESULT_PLACEHOLDER);
-    els.copyTaskBtn.disabled = true;
-    updateContinueChatButton();
   }
 
   async function addFiles(target, fileList) {
@@ -2336,6 +2748,21 @@
       return;
     }
     state.internalImagePasteAt = Date.now();
+  }
+
+  function markInternalClipboardCopy() {
+    state.internalClipboardCopyAt = Date.now();
+    state.internalClipboardCopyText = getInternalClipboardCopyText();
+  }
+
+  function getInternalClipboardCopyText() {
+    var target = document.activeElement;
+    if (target && (target.tagName === "TEXTAREA" || target.tagName === "INPUT")) {
+      var start = typeof target.selectionStart === "number" ? target.selectionStart : 0;
+      var end = typeof target.selectionEnd === "number" ? target.selectionEnd : start;
+      return String(target.value || "").slice(start, end).trim();
+    }
+    return String(window.getSelection ? window.getSelection() || "" : "").trim();
   }
 
   function isEditablePasteTarget(target) {
@@ -2541,7 +2968,6 @@
       state.taskAttachments = state.taskAttachments.filter(function (attachment) {
         return attachment.id !== id;
       });
-      invalidateActiveTaskResultForInputChange();
       renderAttachments("task");
       updateContinueChatButton();
       syncActiveTaskFromInput({ immediate: true });
@@ -3281,6 +3707,7 @@
     }
 
     try {
+      markProgrammaticClipboardCopy(text);
       if (api.copyText) {
         await api.copyText(text);
       } else if (navigator.clipboard) {
@@ -3291,6 +3718,11 @@
       showCodeCopyState(button, "failed");
       showToast("复制没成功：" + getErrorMessage(error));
     }
+  }
+
+  function markProgrammaticClipboardCopy(text) {
+    state.internalClipboardCopyAt = Date.now();
+    state.internalClipboardCopyText = String(text || "").trim();
   }
 
   function showCodeCopyState(button, stateName, defaultTitle) {
@@ -5758,6 +6190,15 @@
     return {
       inputText: typeof source.inputText === "string" ? source.inputText : "",
       result: typeof source.result === "string" ? source.result : "",
+      resultInputText: typeof source.resultInputText === "string" ? source.resultInputText : "",
+      resultAttachments: Array.isArray(source.resultAttachments)
+        ? source.resultAttachments.map(normalizeAttachment).filter(Boolean)
+        : [],
+      resultSourceCaptured: source.resultSourceCaptured === true ||
+        Boolean(
+          (typeof source.resultInputText === "string" && source.resultInputText) ||
+          (Array.isArray(source.resultAttachments) && source.resultAttachments.length)
+        ),
       cancelled: source.cancelled === true,
       attachments: Array.isArray(source.attachments)
         ? source.attachments.map(normalizeAttachment).filter(Boolean)
@@ -6651,7 +7092,7 @@
     if (state.activeTab === "task") {
       var taskState = getActiveTaskState();
       if (state.currentResult || taskState.cancelled) {
-        renderTaskResult(state.currentResult, taskState.cancelled);
+        renderTaskResult(state.currentResult, taskState.cancelled, { preserveScroll: true });
       }
       return;
     }
@@ -6887,6 +7328,7 @@
         return fetchModelsInBrowser(payload);
       },
       abortActive: function () {},
+      abortTask: function () {},
       abortChat: function () {},
       getUser: function () {
         return null;
@@ -6900,7 +7342,8 @@
           return navigator.clipboard.readText();
         }
         return "";
-      }
+      },
+      onClipboardChange: function () {}
     };
   }
 })();

@@ -71,6 +71,8 @@ let cryptoModule = null;
 let osModule = null;
 let cachedConfig = null;
 const activeChatRequests = new Map();
+const activeTaskRequests = new Map();
+const cancelledRequests = new Set();
 let lastEnterAction = null;
 let clipboardSnapshotText = "";
 let clipboardChangedAt = 0;
@@ -82,6 +84,7 @@ let clipboardWatcherTimer = null;
 let clipboardWatcherIntervalMs = 0;
 const enterListeners = new Set();
 const outListeners = new Set();
+const clipboardListeners = new Set();
 
 if (typeof utools !== "undefined" && utools.onPluginEnter) {
   utools.onPluginEnter((action) => {
@@ -121,6 +124,7 @@ window.aiChat = {
     return runTask(Object.assign({}, payload, { mode: "ocr" }), onEvent);
   },
   abortActive,
+  abortTask,
   abortChat,
   copyText,
   getClipboardText,
@@ -140,6 +144,10 @@ window.aiChat = {
     outListeners.add(listener);
     return () => outListeners.delete(listener);
   },
+  onClipboardChange(listener) {
+    clipboardListeners.add(listener);
+    return () => clipboardListeners.delete(listener);
+  },
   getLastEnterAction() {
     return lastEnterAction;
   }
@@ -150,13 +158,39 @@ function normalizeEnterAction(action) {
   return {
     code: typeof source.code === "string" ? source.code : "",
     type: typeof source.type === "string" ? source.type : "",
+    from: typeof source.from === "string" ? source.from : "",
     keyword: typeof source.keyword === "string" ? source.keyword : "",
     cmd: typeof source.cmd === "string" ? source.cmd : "",
     name: typeof source.name === "string" ? source.name : "",
     label: typeof source.label === "string" ? source.label : "",
     option: source.option,
-    payload: source.payload
+    payload: normalizeEnterPayload(source)
   };
+}
+
+function normalizeEnterPayload(source) {
+  if (Object.prototype.hasOwnProperty.call(source, "payload") && source.payload !== undefined) {
+    return source.payload;
+  }
+  if (typeof source.text === "string") {
+    return source.text;
+  }
+  if (typeof source.value === "string") {
+    return source.value;
+  }
+  if (Object.prototype.hasOwnProperty.call(source, "data")) {
+    return source.data;
+  }
+  if (Object.prototype.hasOwnProperty.call(source, "files")) {
+    return source.files;
+  }
+  if (Object.prototype.hasOwnProperty.call(source, "file")) {
+    return source.file;
+  }
+  if (Object.prototype.hasOwnProperty.call(source, "path")) {
+    return source.path;
+  }
+  return source.payload;
 }
 
 function dispatchEnterAction(action) {
@@ -192,6 +226,30 @@ function dispatchOutAction(action) {
       console.error(error);
     }
   });
+}
+
+function dispatchClipboardChange(event) {
+  const payload = normalizeClipboardChangeEvent(event);
+  if (!payload.text && !payload.images.length) {
+    return;
+  }
+  clipboardListeners.forEach((listener) => {
+    try {
+      listener(payload);
+    } catch (error) {
+      console.error(error);
+    }
+  });
+}
+
+function normalizeClipboardChangeEvent(event) {
+  const source = event && typeof event === "object" ? event : {};
+  return {
+    text: typeof source.text === "string" ? source.text : "",
+    images: Array.isArray(source.images)
+      ? source.images.map(normalizeStoredAttachment).filter(Boolean)
+      : []
+  };
 }
 
 function getConfig() {
@@ -265,10 +323,13 @@ function saveTaskStore(store) {
 }
 
 async function runTask(payload, onEvent) {
-  abortActive();
   const mode = normalizeMode(payload && payload.mode);
   const text = String((payload && payload.text) || "").trim();
   const attachments = normalizeAttachments(payload && payload.attachments);
+  const requestId =
+    payload && typeof payload.requestId === "string" && payload.requestId
+      ? payload.requestId
+      : "";
   if (!text && !attachments.length) {
     throw new Error("输入为空");
   }
@@ -283,7 +344,7 @@ async function runTask(payload, onEvent) {
   }
   validateProvider(provider);
   const messages = buildTaskMessages(mode, text, attachments, provider);
-  return completeWithMessages(provider, messages, onEvent);
+  return completeWithMessages(provider, messages, onEvent, { requestId, requestKind: "task" });
 }
 
 async function sendChat(payload, onEvent) {
@@ -298,7 +359,7 @@ async function sendChat(payload, onEvent) {
     payload && typeof payload.requestId === "string" && payload.requestId
       ? payload.requestId
       : "";
-  return completeWithMessages(provider, messages, onEvent, { requestId });
+  return completeWithMessages(provider, messages, onEvent, { requestId, requestKind: "chat" });
 }
 
 async function fetchModels(payload) {
@@ -339,7 +400,9 @@ async function completeWithMessages(provider, messages, onEvent, requestOptions)
   }
 
   try {
+    throwIfRequestCancelled(options);
     const proxy = await resolveProxy(provider, endpoint.href);
+    throwIfRequestCancelled(options);
     emit(onEvent, {
       type: "status",
       message: "生成中"
@@ -347,10 +410,12 @@ async function completeWithMessages(provider, messages, onEvent, requestOptions)
 
     let result;
     try {
+      throwIfRequestCancelled(options);
       result = proxy
         ? await requestViaProxy(endpoint, provider, body, headers, proxy, onEvent, options)
         : await requestDirect(endpoint, provider, body, headers, onEvent, options);
     } catch (error) {
+      throwIfRequestCancelled(options);
       if (!shouldRetryWithoutStreamUsage(error)) {
         throw error;
       }
@@ -359,11 +424,13 @@ async function completeWithMessages(provider, messages, onEvent, requestOptions)
       if (provider.apiKey) {
         headers.Authorization = `Bearer ${provider.apiKey}`;
       }
+      throwIfRequestCancelled(options);
       result = proxy
         ? await requestViaProxy(endpoint, provider, body, headers, proxy, onEvent, options)
         : await requestDirect(endpoint, provider, body, headers, onEvent, options);
     }
 
+    throwIfRequestCancelled(options);
     const content = typeof result === "string" ? result : result.content || "";
     emit(onEvent, { type: "done", text: content, usage: result.usage || null });
     return {
@@ -376,7 +443,8 @@ async function completeWithMessages(provider, messages, onEvent, requestOptions)
     throw error;
   } finally {
     if (options.requestId) {
-      activeChatRequests.delete(options.requestId);
+      getActiveRequestMap(options).delete(options.requestId);
+      clearRequestCancellation(options);
     } else {
       activeRequest = null;
       activeSocket = null;
@@ -428,12 +496,15 @@ function abortActive() {
   }
 }
 
-function abortChat(requestId) {
-  const entry = activeChatRequests.get(String(requestId || ""));
+function abortTrackedRequest(requestId, requestKind) {
+  const key = String(requestId || "");
+  markRequestCancelled({ requestId: key, requestKind });
+  const requestMap = getActiveRequestMap({ requestKind });
+  const entry = requestMap.get(key);
   if (!entry) {
     return;
   }
-  activeChatRequests.delete(String(requestId || ""));
+  requestMap.delete(key);
   if (entry.request && !entry.request.destroyed) {
     entry.request.destroy(new Error("请求已取消"));
   }
@@ -442,8 +513,49 @@ function abortChat(requestId) {
   }
 }
 
+function abortTask(requestId) {
+  abortTrackedRequest(requestId, "task");
+}
+
+function abortChat(requestId) {
+  abortTrackedRequest(requestId, "chat");
+}
+
+function requestCancellationKey(requestOptions) {
+  const requestId = requestOptions && requestOptions.requestId;
+  if (!requestId) {
+    return "";
+  }
+  const requestKind = requestOptions.requestKind === "task" ? "task" : "chat";
+  return `${requestKind}:${requestId}`;
+}
+
+function markRequestCancelled(requestOptions) {
+  const key = requestCancellationKey(requestOptions);
+  if (key) {
+    cancelledRequests.add(key);
+  }
+}
+
+function clearRequestCancellation(requestOptions) {
+  const key = requestCancellationKey(requestOptions);
+  if (key) {
+    cancelledRequests.delete(key);
+  }
+}
+
+function throwIfRequestCancelled(requestOptions) {
+  const key = requestCancellationKey(requestOptions);
+  if (key && cancelledRequests.has(key)) {
+    throw new Error("请求已取消");
+  }
+}
+
 function abortAllActiveRequests() {
   abortActive();
+  Array.from(activeTaskRequests.keys()).forEach((requestId) => {
+    abortTask(requestId);
+  });
   Array.from(activeChatRequests.keys()).forEach((requestId) => {
     abortChat(requestId);
   });
@@ -558,7 +670,7 @@ function getOs() {
 }
 
 function getRecentClipboardText(maxAgeMs) {
-  updateClipboardSnapshot({ readImage: false });
+  updateClipboardSnapshot({ readImage: false, notify: false });
   const ageLimit = Number(maxAgeMs) || 0;
   if (!clipboardChangedAt || !ageLimit || Date.now() - clipboardChangedAt > ageLimit) {
     return "";
@@ -567,7 +679,7 @@ function getRecentClipboardText(maxAgeMs) {
 }
 
 function getRecentClipboardImage(maxAgeMs) {
-  updateClipboardSnapshot({ readText: false });
+  updateClipboardSnapshot({ readText: false, notify: false });
   const ageLimit = Number(maxAgeMs) || 0;
   if (!clipboardImageChangedAt || !ageLimit || Date.now() - clipboardImageChangedAt > ageLimit) {
     return null;
@@ -707,10 +819,10 @@ function startClipboardWatcher(intervalMs) {
   }
   clipboardWatcherIntervalMs = nextIntervalMs;
   clipboardSnapshotText = safeReadClipboardText();
-  clipboardSnapshotImage = null;
-  clipboardImageFingerprint = "";
+  clipboardSnapshotImage = safeReadClipboardImage();
+  clipboardImageFingerprint = createClipboardImageFingerprint(clipboardSnapshotImage);
   clipboardImageChangedAt = 0;
-  clipboardImageBaselinePending = true;
+  clipboardImageBaselinePending = false;
   clipboardWatcherTimer = setInterval(updateClipboardSnapshot, nextIntervalMs);
 }
 
@@ -719,10 +831,17 @@ function updateClipboardSnapshot(options) {
     return;
   }
   const settings = options || {};
+  const notify = settings.notify !== false;
+  let textChanged = false;
+  let nextText = "";
+  let imageChanged = false;
+  let nextImage = null;
   if (settings.readText !== false) {
     const value = safeReadClipboardText();
     if (value !== clipboardSnapshotText) {
       rememberClipboardText(value);
+      textChanged = true;
+      nextText = value;
     }
   }
 
@@ -734,11 +853,22 @@ function updateClipboardSnapshot(options) {
       clipboardImageFingerprint = imageFingerprint;
       clipboardImageChangedAt = 0;
       clipboardImageBaselinePending = false;
-      return;
-    }
-    if (imageFingerprint !== clipboardImageFingerprint) {
+    } else if (imageFingerprint !== clipboardImageFingerprint) {
       rememberClipboardImage(image, imageFingerprint);
+      imageChanged = true;
+      nextImage = image;
     }
+  }
+
+  if (!notify) {
+    return;
+  }
+  if (imageChanged && nextImage) {
+    dispatchClipboardChange({ text: "", images: [nextImage] });
+    return;
+  }
+  if (textChanged && nextText.trim()) {
+    dispatchClipboardChange({ text: nextText.trim(), images: [] });
   }
 }
 
@@ -2218,11 +2348,18 @@ function trackActiveRequest(requestOptions, request, socket) {
     activeSocket = socket || activeSocket || null;
     return;
   }
-  const previous = activeChatRequests.get(requestId) || {};
-  activeChatRequests.set(requestId, {
+  const requestMap = getActiveRequestMap(requestOptions);
+  const previous = requestMap.get(requestId) || {};
+  requestMap.set(requestId, {
     request: request || previous.request || null,
     socket: socket || previous.socket || null
   });
+}
+
+function getActiveRequestMap(requestOptions) {
+  return requestOptions && requestOptions.requestKind === "task"
+    ? activeTaskRequests
+    : activeChatRequests;
 }
 
 function requestTextWithOptions(transport, options) {
@@ -2647,6 +2784,15 @@ function normalizeTaskStoreEntry(entry) {
   return {
     inputText: typeof source.inputText === "string" ? source.inputText : "",
     result: typeof source.result === "string" ? source.result : "",
+    resultInputText: typeof source.resultInputText === "string" ? source.resultInputText : "",
+    resultAttachments: Array.isArray(source.resultAttachments)
+      ? source.resultAttachments.map(normalizeStoredAttachment).filter(Boolean)
+      : [],
+    resultSourceCaptured: source.resultSourceCaptured === true ||
+      Boolean(
+        (typeof source.resultInputText === "string" && source.resultInputText) ||
+        (Array.isArray(source.resultAttachments) && source.resultAttachments.length)
+      ),
     cancelled: source.cancelled === true,
     attachments: Array.isArray(source.attachments)
       ? source.attachments.map(normalizeStoredAttachment).filter(Boolean)
